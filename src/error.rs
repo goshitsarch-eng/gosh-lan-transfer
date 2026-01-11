@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0
+// SPDX-License-Identifier: MIT
 // gosh-lan-transfer - Error types for the engine
 
 use thiserror::Error;

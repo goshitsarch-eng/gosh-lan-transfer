@@ -1,15 +1,16 @@
-// SPDX-License-Identifier: AGPL-3.0
+// SPDX-License-Identifier: MIT
 // gosh-lan-transfer - HTTP client for sending file transfers
 //
 // The client explicitly resolves hostnames and attempts all IPs.
 // This ensures reliable connections over LAN, Tailscale, and VPNs.
 
 use crate::error::{EngineError, EngineResult};
-use crate::events::{EngineEvent, EventHandler};
-use crate::types::{
-    NetworkInterface, ResolveResult, TransferApprovalStatus, TransferDecision, TransferFile,
-    TransferProgress, TransferRequest, TransferResponse,
+use crate::events::EventHandler;
+use crate::protocol::{
+    EngineEvent, TransferApprovalStatus, TransferDecision, TransferFile, TransferProgress,
+    TransferRequest, TransferResponse,
 };
+use crate::types::{NetworkInterface, ResolveResult};
 use futures::StreamExt;
 use reqwest::{Body, Client};
 use std::{

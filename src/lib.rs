@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0
+// SPDX-License-Identifier: MIT
 //! # gosh-lan-transfer
 //!
 //! A Rust library for peer-to-peer file transfers over LAN, VPN, or Tailscale networks.
@@ -54,19 +54,32 @@ pub mod config;
 pub mod error;
 pub mod events;
 pub mod favorites;
+pub mod protocol;
 pub mod server;
 pub mod types;
 
+// Protocol types (boundary-crossing messages)
+pub use protocol::{
+    EngineEvent, PeerInfo, PendingTransfer, TransferApprovalStatus, TransferDecision,
+    TransferDirection, TransferFile, TransferProgress, TransferRequest, TransferResponse,
+    TransferStatus,
+};
+
+// Event handling infrastructure
+pub use events::{
+    callback_handler, channel_handler, noop_handler, CallbackEventHandler, ChannelEventHandler,
+    EventHandler, NoopEventHandler,
+};
+
+// Engine components
 pub use client::{get_network_interfaces, TransferClient};
 pub use config::{EngineConfig, EngineConfigBuilder};
 pub use error::{EngineError, EngineResult};
-pub use events::{
-    callback_handler, channel_handler, noop_handler, CallbackEventHandler, ChannelEventHandler,
-    EngineEvent, EventHandler, NoopEventHandler,
-};
 pub use favorites::{FavoritesPersistence, InMemoryFavorites};
 pub use server::{ServerHandle, ServerState};
-pub use types::*;
+
+// Domain types
+pub use types::{Favorite, NetworkInterface, ResolveResult, TransferRecord};
 
 use std::path::PathBuf;
 use std::sync::Arc;

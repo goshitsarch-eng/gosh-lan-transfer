@@ -1,38 +1,13 @@
-// SPDX-License-Identifier: AGPL-3.0
-// gosh-lan-transfer - Event system for the engine
+// SPDX-License-Identifier: MIT
+//! Event handling infrastructure for gosh-lan-transfer
+//!
+//! This module provides the `EventHandler` trait and implementations
+//! for receiving engine events. The event types themselves are defined
+//! in the `protocol` module.
 
-use crate::types::{PendingTransfer, TransferProgress};
+use crate::protocol::EngineEvent;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-
-/// Events emitted by the engine
-#[derive(Debug, Clone)]
-pub enum EngineEvent {
-    /// New transfer request awaiting approval
-    TransferRequest(PendingTransfer),
-
-    /// Progress update for an active transfer
-    TransferProgress(TransferProgress),
-
-    /// Transfer completed successfully
-    TransferComplete {
-        transfer_id: String,
-    },
-
-    /// Transfer failed
-    TransferFailed {
-        transfer_id: String,
-        error: String,
-    },
-
-    /// Server started successfully
-    ServerStarted {
-        port: u16,
-    },
-
-    /// Server stopped
-    ServerStopped,
-}
 
 /// Trait for receiving engine events
 ///

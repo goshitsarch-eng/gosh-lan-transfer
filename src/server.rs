@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0
+// SPDX-License-Identifier: MIT
 // gosh-lan-transfer - HTTP server for receiving file transfers
 //
 // The server binds to 0.0.0.0 and :: to accept connections from any interface.
@@ -31,10 +31,10 @@ use uuid::Uuid;
 
 use crate::config::EngineConfig;
 use crate::error::{EngineError, EngineResult};
-use crate::events::{EngineEvent, EventHandler};
-use crate::types::{
-    PendingTransfer, TransferApprovalStatus, TransferDecision, TransferProgress, TransferRequest,
-    TransferResponse,
+use crate::events::EventHandler;
+use crate::protocol::{
+    EngineEvent, PendingTransfer, TransferApprovalStatus, TransferDecision, TransferProgress,
+    TransferRequest, TransferResponse,
 };
 
 /// Server state shared across handlers

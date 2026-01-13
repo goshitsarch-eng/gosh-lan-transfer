@@ -2,22 +2,31 @@
 
 A Rust library for peer-to-peer file transfers over LAN, VPN, or Tailscale networks.
 
-This crate provides the core transfer engine without any GUI dependencies, making it suitable for use in CLI tools, desktop applications, or as a library dependency.
+This crate provides the core transfer engine without any GUI dependencies, making it suitable for integration into CLI tools, desktop applications, mobile apps, or headless services. Files transfer directly between devices with no cloud intermediary, keeping your data private and your transfers fast.
 
-## Features
+## Why gosh-lan-transfer?
 
-- **Direct peer-to-peer transfers** - No cloud, no intermediary servers
-- **Cross-platform** - Works on Linux, macOS, and Windows
-- **Async/await** - Built on Tokio for efficient async I/O
-- **Event-driven** - Flexible event system via traits or channels
-- **Trust-based approval** - Auto-accept transfers from trusted hosts
-- **Progress tracking** - Real-time progress updates during transfers
-- **Directory transfers** - Send entire directories with structure preserved
-- **Transfer history** - Automatic recording of completed/failed transfers
-- **Retry logic** - Automatic retry with exponential backoff for transient failures
-- **Batch operations** - Accept or reject all pending transfers at once
-- **Favorites management** - Save and manage frequently used peers
-- **Zero GUI dependencies** - Use from CLI, GUI, or headless applications
+Sharing files between devices on the same network shouldn't require uploading to the cloud, installing platform-specific software, or configuring SSH keys. Yet existing solutions each come with significant limitations.
+
+**AirDrop and Nearby Share** work seamlessly within their ecosystems, but they lock you into Apple or Google platforms respectively. If you have a mix of devices—a MacBook, a Windows desktop, a Linux server, and an Android phone—these solutions leave you stranded.
+
+**Cloud services** like Dropbox, Google Drive, or WeTransfer solve the cross-platform problem, but they route your files through external servers. For a 10GB video file sitting on your laptop that you want on your desktop three feet away, uploading to the cloud and downloading again wastes time and bandwidth. It also means your files pass through third-party infrastructure, which may be unacceptable for sensitive data.
+
+**SCP and rsync** are powerful and cross-platform, but they require SSH access, key management, and command-line knowledge. They're tools for sysadmins, not for quickly sending a folder to a colleague.
+
+**LocalSend** offers a good user experience for casual file sharing, but it's an end-user application, not a library. If you're building your own file-sharing feature into an application, you can't easily integrate it.
+
+gosh-lan-transfer takes a different approach. It's a library first, designed to be embedded into whatever application you're building. The HTTP-based protocol works across any platform that supports TCP. There's no proprietary discovery mechanism that might break across network boundaries—you simply specify the target device's IP or hostname. It works equally well on traditional LANs, corporate VPNs, and Tailscale networks where mDNS discovery often fails.
+
+The library handles the complexity of file transfer—progress tracking, approval workflows, retry logic, directory transfers—while staying out of your way on everything else. You provide the UI, the storage backend, and the user experience. gosh-lan-transfer provides reliable, fast, direct transfers.
+
+## Core Capabilities
+
+The engine supports sending individual files or entire directory trees with their structure preserved. When receiving, transfers require explicit approval unless the sender is in your trusted hosts list, preventing unwanted file pushes. Progress updates stream in real-time with transfer speeds calculated on the fly. If a network hiccup interrupts the connection, automatic retry with exponential backoff handles transient failures gracefully.
+
+The event-driven architecture means your application stays responsive. Whether you're building a GUI that needs to update a progress bar, a CLI that prints status to the terminal, or a headless service that logs to a file, the same event stream powers all of them. Three built-in event handlers cover common cases, and implementing your own takes just a few lines.
+
+For applications that need to remember transfer history or save frequently-used peers, the library defines persistence traits that you implement with whatever storage backend fits your needs—SQLite, JSON files, or a full database. In-memory implementations ship with the library for testing and simple use cases.
 
 ## Installation
 
@@ -84,6 +93,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Architecture
 
+The library centers on `GoshTransferEngine`, which coordinates all operations. Internally, it manages an HTTP server for receiving files and an HTTP client for sending them. The engine exposes a high-level API while handling connection management, progress tracking, and error recovery behind the scenes.
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    GoshTransferEngine                        │
@@ -110,9 +121,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## Module Organization
+Types are organized with a clear separation between what crosses the engine boundary and what stays internal. The `protocol` module contains wire protocol types and event payloads—anything sent over HTTP or emitted as an event lives here. The `types` module holds domain entities like favorites and transfer records that don't leave the local process.
 
-The crate is organized with a clear separation between protocol types and internal implementation:
+## Module Organization
 
 ```
 src/
@@ -128,36 +139,15 @@ src/
 └── history.rs      # HistoryPersistence trait
 ```
 
-### Protocol Module
-
-The `protocol` module contains all types that cross the engine boundary:
-
-| Category | Types |
-|----------|-------|
-| **Wire Protocol** | `TransferRequest`, `TransferResponse`, `TransferApprovalStatus`, `TransferFile`, `PeerInfo` |
-| **Events** | `EngineEvent`, `TransferProgress`, `PendingTransfer` |
-| **Status Enums** | `TransferStatus`, `TransferDirection`, `TransferDecision` |
-
-**Rule**: If it crosses the engine boundary (sent over HTTP or emitted as an event), it belongs in `protocol`.
-
-### Types Module
-
-The `types` module contains domain entities that don't cross boundaries:
-
-| Type | Purpose |
-|------|---------|
-| `Favorite` | Saved peer for quick access (persistence) |
-| `TransferRecord` | Completed transfer history |
-| `NetworkInterface` | Local network interface info |
-| `ResolveResult` | DNS resolution result |
-
 ## API Reference
 
 ### GoshTransferEngine
 
-The main entry point for all operations.
+The main entry point for all operations. You create an engine with a configuration and an event handler, then use it to send files, receive files, and manage transfers.
 
 #### Creating an Engine
+
+The library offers several ways to create an engine depending on how you want to handle events. Channel-based events work best for async applications where you want to process events in a separate task. Callback-based events suit simpler use cases or FFI scenarios. The no-op handler discards all events, useful for batch operations or testing.
 
 ```rust
 use gosh_lan_transfer::{GoshTransferEngine, EngineConfig, callback_handler, EngineEvent};
@@ -179,6 +169,8 @@ let mut engine = GoshTransferEngine::new(EngineConfig::default(), noop_handler()
 ```
 
 #### Server Operations
+
+The HTTP server listens for incoming transfer requests. Starting and stopping the server is straightforward, and you can change the port at runtime if needed. When you change the port, the server gracefully shuts down and restarts on the new port. If binding to the new port fails, it automatically rolls back to the previous port.
 
 ```rust
 // Start the HTTP server
@@ -204,10 +196,11 @@ engine.change_port_with_options(8080, false).await?;
 
 #### Sending Files
 
+Sending files involves specifying the target peer's address and port, along with the files to send. The engine handles DNS resolution, negotiates the transfer with the peer, waits for approval, and streams the files with progress updates.
+
 ```rust
 use std::path::PathBuf;
 
-// Send files to a peer
 let files = vec![
     PathBuf::from("/path/to/document.pdf"),
     PathBuf::from("/path/to/image.png"),
@@ -216,26 +209,19 @@ let files = vec![
 engine.send_files("192.168.1.100", 53317, files).await?;
 ```
 
-The send operation:
-1. Sends transfer metadata to the peer
-2. Waits for approval (up to 2 minutes)
-3. Streams each file with progress updates
-4. Emits `TransferComplete` or `TransferFailed` event
-5. Automatically retries on transient network errors
+The send operation first transmits file metadata to the peer, then waits up to two minutes for approval. Once approved, it streams each file while emitting progress events. If the network connection drops, it automatically retries with exponential backoff. When all files are sent, a `TransferComplete` event fires; if something goes wrong, you get a `TransferFailed` event with the error details.
 
 #### Sending Directories
 
+For directory transfers, the library recursively enumerates all files and sends them with their relative paths preserved. The receiver automatically recreates the directory structure under its download directory.
+
 ```rust
-// Send an entire directory with structure preserved
 engine.send_directory("192.168.1.100", 53317, "/path/to/folder").await?;
 ```
 
-The directory is recursively enumerated and all files are sent with their relative paths.
-The receiver automatically creates the directory structure.
-
 #### Receiving Files
 
-When a transfer request comes in, you'll receive a `TransferRequest` event:
+When a transfer request arrives, your application receives a `TransferRequest` event containing the sender's IP, device name, file list, and total size. You then decide whether to accept or reject the transfer. Accepted transfers receive a unique token that authorizes the sender to upload files.
 
 ```rust
 match event {
@@ -245,7 +231,6 @@ match event {
         println!("Files: {:?}", transfer.files);
         println!("Total size: {} bytes", transfer.total_size);
 
-        // Accept or reject the transfer
         if should_accept(&transfer) {
             engine.accept_transfer(&transfer.id).await?;
         } else {
@@ -256,21 +241,12 @@ match event {
 }
 ```
 
-#### Pending Transfers
-
-```rust
-// Get all pending transfers awaiting approval
-let pending = engine.get_pending_transfers().await;
-for transfer in pending {
-    println!("{}: {} files from {}",
-        transfer.id, transfer.files.len(), transfer.source_ip);
-}
-```
-
 #### Batch Operations
 
+When multiple transfers are pending, you can accept or reject them all at once. The batch methods return results for each transfer, so you can handle individual failures.
+
 ```rust
-// Accept all pending transfers at once
+// Accept all pending transfers
 let results = engine.accept_all_transfers().await;
 for (transfer_id, result) in results {
     match result {
@@ -279,34 +255,28 @@ for (transfer_id, result) in results {
     }
 }
 
-// Reject all pending transfers at once
+// Reject all pending transfers
 let results = engine.reject_all_transfers().await;
-for (transfer_id, result) in results {
-    if let Err(e) = result {
-        eprintln!("Failed to reject {}: {}", transfer_id, e);
-    }
-}
 ```
 
 #### Cancelling Transfers
 
+You can cancel an in-progress transfer at any time. Cancellation emits a `TransferFailed` event and causes subsequent upload attempts to be rejected.
+
 ```rust
-// Cancel an in-progress transfer
 engine.cancel_transfer(&transfer.id).await?;
-// This emits a TransferFailed event and rejects further uploads
 ```
 
 #### Network Utilities
 
+The library includes utilities for DNS resolution, network interface enumeration, and peer health checks. These help you build features like peer discovery or connection status indicators.
+
 ```rust
-// Resolve hostname to IPs (returns ResolveResult)
+// Resolve hostname to IPs
 let result = GoshTransferEngine::resolve_address("mypc.local");
 if result.success {
     println!("Resolved to: {:?}", result.ips);
 }
-
-// Or use the error-returning variant
-let ips = GoshTransferEngine::resolve_address_or_err("mypc.local")?;
 
 // Get all network interfaces
 let interfaces = GoshTransferEngine::get_network_interfaces();
@@ -316,10 +286,9 @@ for iface in interfaces {
     }
 }
 
-// Check if a peer is reachable (returns EngineResult<bool>)
+// Check if a peer is reachable
 match engine.check_peer("192.168.1.100", 53317).await {
     Ok(true) => println!("Peer is online"),
-    Ok(false) => println!("Peer returned error status"),
     Err(e) => println!("Could not reach peer: {}", e),
 }
 
@@ -329,6 +298,8 @@ println!("Peer name: {}", info["name"]);
 ```
 
 #### Configuration Management
+
+Configuration can be updated at runtime. Trusted hosts determine which peers can send files without requiring manual approval.
 
 ```rust
 // Get current config
@@ -345,20 +316,16 @@ engine.update_config(new_config).await;
 // Manage trusted hosts
 engine.add_trusted_host("192.168.1.50".to_string()).await;
 engine.remove_trusted_host("192.168.1.50").await;
-
-let trusted = engine.trusted_hosts();
-println!("Trusted hosts: {:?}", trusted);
 ```
 
 ### EngineConfig
 
-Configuration for the engine.
+The configuration uses a builder pattern with sensible defaults. You can create a working configuration with just `EngineConfig::default()`, or customize specific fields as needed.
 
 ```rust
 use gosh_lan_transfer::EngineConfig;
 use std::path::PathBuf;
 
-// Using builder pattern
 let config = EngineConfig::builder()
     .port(53317)                              // HTTP server port
     .device_name("My Device")                 // Name shown to peers
@@ -367,143 +334,79 @@ let config = EngineConfig::builder()
     .receive_only(false)                      // Allow sending
     .max_retries(3)                           // Retry failed transfers
     .retry_delay_ms(1000)                     // Delay between retries
-    .bandwidth_limit_bps(Some(10_000_000))    // Limit to 10 MB/s (optional)
     .build();
-
-// Using defaults
-let config = EngineConfig::default();
-// port: 53317
-// device_name: system hostname
-// download_dir: current directory
-// trusted_hosts: empty
-// receive_only: false
-// max_retries: 3
-// retry_delay_ms: 1000
-// bandwidth_limit_bps: None (unlimited)
 ```
+
+The defaults use port 53317, the system hostname as the device name, the current directory for downloads, no trusted hosts, and three retry attempts with a one-second base delay.
 
 ### Events
 
-The engine emits events for all significant operations.
+The engine emits events for all significant state changes. Your application subscribes to these events to update UI, log activity, or trigger other actions.
 
 ```rust
 use gosh_lan_transfer::EngineEvent;
 
 match event {
-    // New transfer request received
     EngineEvent::TransferRequest(transfer) => {
-        // transfer.id: String
-        // transfer.source_ip: String
-        // transfer.sender_name: Option<String>
-        // transfer.files: Vec<TransferFile>
-        // transfer.total_size: u64
-        // transfer.received_at: DateTime<Utc>
+        // New transfer request received, awaiting approval
     }
 
-    // Progress update during transfer
     EngineEvent::TransferProgress(progress) => {
-        // progress.transfer_id: String
-        // progress.current_file: Option<String>
-        // progress.bytes_transferred: u64
-        // progress.total_bytes: u64
-        // progress.speed_bps: u64
+        // Progress update with bytes transferred, total bytes, and speed
     }
 
-    // Transfer completed successfully
     EngineEvent::TransferComplete { transfer_id } => {
-        println!("Transfer {} done!", transfer_id);
+        // Transfer finished successfully
     }
 
-    // Transfer failed
     EngineEvent::TransferFailed { transfer_id, error } => {
-        eprintln!("Transfer {} failed: {}", transfer_id, error);
+        // Transfer failed with error message
     }
 
-    // Transfer retry attempt (emitted before each retry)
     EngineEvent::TransferRetry { transfer_id, attempt, max_attempts, error } => {
-        eprintln!("Retrying {} (attempt {}/{}): {}",
-            transfer_id, attempt, max_attempts, error);
+        // Retrying after transient failure
     }
 
-    // Server started
     EngineEvent::ServerStarted { port } => {
-        println!("Server listening on port {}", port);
+        // Server is now listening
     }
 
-    // Server stopped
     EngineEvent::ServerStopped => {
-        println!("Server stopped");
+        // Server has shut down
     }
 
-    // Server port changed
     EngineEvent::PortChanged { old_port, new_port } => {
-        println!("Port changed from {} to {}", old_port, new_port);
+        // Server port changed at runtime
     }
 }
 ```
 
 ### Event Handlers
 
-Three built-in event handler implementations:
-
-#### ChannelEventHandler
-
-Best for async applications. Uses Tokio broadcast channels.
+Three built-in handlers cover common scenarios. The channel handler uses Tokio broadcast channels and supports multiple subscribers, making it ideal for async applications. The callback handler wraps a closure, suitable for simple cases or FFI. The no-op handler discards events silently.
 
 ```rust
 use gosh_lan_transfer::channel_handler;
 
-let (handler, mut receiver) = channel_handler(100); // buffer size
+// Channel-based: multiple subscribers, async-friendly
+let (handler, mut receiver) = channel_handler(100);
 
-// In async task
 tokio::spawn(async move {
     while let Ok(event) = receiver.recv().await {
         // Handle event
     }
 });
 
-// Multiple subscribers supported
+// Additional subscribers can be created
 let mut receiver2 = handler.subscribe();
 ```
 
-#### CallbackEventHandler
-
-Best for simple use cases or FFI.
-
-```rust
-use gosh_lan_transfer::callback_handler;
-
-let handler = callback_handler(|event| {
-    match event {
-        EngineEvent::TransferProgress(p) => {
-            let pct = (p.bytes_transferred * 100) / p.total_bytes;
-            print!("\rProgress: {}%", pct);
-        }
-        _ => {}
-    }
-});
-```
-
-#### NoopEventHandler
-
-Discards all events. Useful for testing or batch operations.
-
-```rust
-use gosh_lan_transfer::noop_handler;
-
-let engine = GoshTransferEngine::new(config, noop_handler());
-```
-
-#### Custom EventHandler
-
-Implement the trait for custom handling:
+For custom handling, implement the `EventHandler` trait:
 
 ```rust
 use gosh_lan_transfer::{EventHandler, EngineEvent};
 
-struct MyHandler {
-    // your state
-}
+struct MyHandler { /* your state */ }
 
 impl EventHandler for MyHandler {
     fn on_event(&self, event: EngineEvent) {
@@ -512,156 +415,51 @@ impl EventHandler for MyHandler {
 }
 ```
 
-### Favorites Persistence
+### Persistence
 
-The engine provides a `FavoritesPersistence` trait for storing peer favorites.
+The library doesn't impose a storage backend. Instead, it defines traits for favorites and history persistence that you implement with whatever storage fits your application.
+
+#### Favorites
+
+Favorites let users save frequently-used peers for quick access. The `FavoritesPersistence` trait defines CRUD operations, and `InMemoryFavorites` provides a simple in-memory implementation.
 
 ```rust
-use gosh_lan_transfer::{FavoritesPersistence, InMemoryFavorites, Favorite};
+use gosh_lan_transfer::{FavoritesPersistence, InMemoryFavorites};
 
-// In-memory storage (included)
 let store = InMemoryFavorites::new();
 
-// Add a favorite
 let fav = store.add("Living Room PC".into(), "192.168.1.100".into())?;
-println!("Created favorite: {}", fav.id);
-
-// List all favorites
-for fav in store.list()? {
-    println!("{}: {} ({})", fav.id, fav.name, fav.address);
-}
-
-// Update a favorite
 store.update(&fav.id, Some("New Name".into()), None)?;
-
-// Delete a favorite
 store.delete(&fav.id)?;
 ```
 
-#### Custom Persistence
+#### History
 
-Implement the trait for file-based, database, or cloud storage:
-
-```rust
-use gosh_lan_transfer::{FavoritesPersistence, Favorite, EngineResult};
-
-struct FileFavorites {
-    path: PathBuf,
-}
-
-impl FavoritesPersistence for FileFavorites {
-    fn list(&self) -> EngineResult<Vec<Favorite>> {
-        // Load from file
-    }
-
-    fn add(&self, name: String, address: String) -> EngineResult<Favorite> {
-        // Add and save to file
-    }
-
-    fn update(&self, id: &str, name: Option<String>, address: Option<String>)
-        -> EngineResult<Favorite> {
-        // Update and save
-    }
-
-    fn delete(&self, id: &str) -> EngineResult<()> {
-        // Delete and save
-    }
-
-    fn get(&self, id: &str) -> EngineResult<Option<Favorite>> {
-        // Find by ID
-    }
-}
-```
-
-### History Persistence
-
-The engine automatically records completed and failed transfers when a `HistoryPersistence` implementation is provided.
+Transfer history records completed and failed transfers automatically when you provide a `HistoryPersistence` implementation. The `InMemoryHistory` implementation optionally limits how many records it keeps.
 
 ```rust
-use gosh_lan_transfer::{
-    GoshTransferEngine, EngineConfig, HistoryPersistence, InMemoryHistory
-};
+use gosh_lan_transfer::{GoshTransferEngine, EngineConfig, InMemoryHistory};
 use std::sync::Arc;
 
-// Create history storage (in-memory with optional limit)
-let history = Arc::new(InMemoryHistory::new());
-// Or with a limit: InMemoryHistory::with_limit(1000)
-
-// Create engine with history recording
+let history = Arc::new(InMemoryHistory::with_limit(1000));
 let config = EngineConfig::default();
+
 let (mut engine, events) = GoshTransferEngine::with_channel_events_and_history(
     config,
     history.clone(),
 );
 
-// Later: query transfer history
+// Later: query history
 let records = history.list()?;
-for record in records {
-    println!("{}: {} -> {} ({:?})",
-        record.id, record.peer_address,
-        record.files.len(), record.status);
-}
-
-// Paginated listing
-let page = history.list_paginated(0, 10)?; // First 10 records
-
-// Get specific record
-if let Some(record) = history.get("transfer-id")? {
-    println!("Transfer details: {:?}", record);
-}
-
-// Clear history
-history.clear()?;
-```
-
-#### Custom History Persistence
-
-Implement the trait for database or file-based storage:
-
-```rust
-use gosh_lan_transfer::{HistoryPersistence, TransferRecord, EngineResult};
-
-struct DatabaseHistory {
-    // your database connection
-}
-
-impl HistoryPersistence for DatabaseHistory {
-    fn list(&self) -> EngineResult<Vec<TransferRecord>> {
-        // Load all records
-    }
-
-    fn list_paginated(&self, offset: usize, limit: usize) -> EngineResult<Vec<TransferRecord>> {
-        // Load paginated records
-    }
-
-    fn get(&self, transfer_id: &str) -> EngineResult<Option<TransferRecord>> {
-        // Find by ID
-    }
-
-    fn add(&self, record: TransferRecord) -> EngineResult<()> {
-        // Insert record
-    }
-
-    fn delete(&self, transfer_id: &str) -> EngineResult<()> {
-        // Delete record
-    }
-
-    fn clear(&self) -> EngineResult<()> {
-        // Clear all records
-    }
-
-    fn count(&self) -> EngineResult<usize> {
-        // Return count
-    }
-}
+let page = history.list_paginated(0, 10)?;
 ```
 
 ### Error Handling
 
-All operations return `EngineResult<T>` which is `Result<T, EngineError>`.
+All operations return `EngineResult<T>`, which is `Result<T, EngineError>`. The error type covers network issues, file I/O problems, protocol errors, and configuration mistakes.
 
 ```rust
-use gosh_lan_transfer::{EngineError, EngineResult};
+use gosh_lan_transfer::EngineError;
 
 match engine.send_files(addr, port, files).await {
     Ok(()) => println!("Success!"),
@@ -674,39 +472,20 @@ match engine.send_files(addr, port, files).await {
     Err(EngineError::TransferTimeout) => {
         eprintln!("Peer did not respond in time");
     }
-    Err(EngineError::FileIo(msg)) => {
-        eprintln!("File error: {}", msg);
-    }
-    Err(e) => {
-        eprintln!("Error: {}", e);
-    }
+    Err(e) => eprintln!("Error: {}", e),
 }
 ```
 
-Error variants:
-- `Network(String)` - General network error
-- `DnsResolution(String)` - DNS lookup failed
-- `ConnectionRefused(String)` - Could not connect to peer
-- `TransferRejected` - Peer rejected the transfer
-- `TransferTimeout` - Approval timeout (2 minutes)
-- `TransferNotFound(String)` - Transfer ID not found
-- `TransferCancelled` - Transfer was cancelled
-- `FileIo(String)` - File read/write error
-- `Serialization(String)` - JSON serialization error
-- `ServerNotRunning` - Server not started
-- `ServerAlreadyRunning` - Server already running
-- `InvalidConfig(String)` - Configuration error
-
 ## Transfer Protocol
 
-The engine uses HTTP for all transfers. This ensures compatibility across firewalls and NAT.
+The engine uses HTTP for all transfers, ensuring compatibility across firewalls and NAT. No custom binary protocol means standard tools can inspect traffic for debugging.
 
 ### Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Health check, returns `{"status": "ok", "app": "gosh-lan-transfer", "version": "..."}` |
-| `/info` | GET | Device info: name, version |
+| `/health` | GET | Health check |
+| `/info` | GET | Device name and version |
 | `/transfer` | POST | Initiate transfer request |
 | `/transfer/status` | GET | Check approval status |
 | `/chunk` | POST | Upload file data |
@@ -738,10 +517,9 @@ SENDER                                    RECEIVER
 
 ### Security
 
-- **Token-based uploads**: Each approved transfer gets a unique UUID token
-- **Filename sanitization**: Path traversal attacks are prevented
-- **Size validation**: Files exceeding declared size are rejected
-- **No authentication**: Designed for trusted networks (LAN, VPN)
+Each approved transfer receives a unique UUID token that must accompany all file uploads, preventing unauthorized data injection. Received filenames are sanitized to prevent path traversal attacks—only the filename component is used, and parent directory references are stripped. Files exceeding their declared size are rejected and deleted.
+
+The library is designed for trusted networks and does not implement user authentication. If you need transfers over untrusted networks, layer TLS on top or use a VPN.
 
 ## Examples
 
@@ -749,7 +527,7 @@ SENDER                                    RECEIVER
 
 ```rust
 use gosh_lan_transfer::{GoshTransferEngine, EngineConfig, EngineEvent, callback_handler};
-use std::{env, path::PathBuf, sync::Arc};
+use std::{env, path::PathBuf};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -762,7 +540,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let address = &args[1];
     let files: Vec<PathBuf> = args[2..].iter().map(PathBuf::from).collect();
 
-    // Progress callback
     let handler = callback_handler(|event| {
         if let EngineEvent::TransferProgress(p) = event {
             let pct = (p.bytes_transferred * 100) / p.total_bytes;
@@ -801,7 +578,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     engine.start_server().await?;
     println!("Listening on port 53317...");
-    println!("Press Ctrl+C to stop");
 
     while let Ok(event) = events.recv().await {
         match event {
@@ -810,10 +586,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for file in &transfer.files {
                     println!("  - {} ({} bytes)", file.name, file.size);
                 }
-
-                // Auto-accept all transfers
                 engine.accept_transfer(&transfer.id).await?;
-                println!("Accepted!");
             }
             EngineEvent::TransferProgress(p) => {
                 let pct = (p.bytes_transferred * 100) / p.total_bytes;
@@ -833,186 +606,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Integration with GUI Framework
-
-```rust
-use gosh_lan_transfer::{GoshTransferEngine, EngineConfig, EngineEvent};
-use std::sync::Arc;
-use tokio::sync::Mutex;
-
-struct MyApp {
-    engine: Arc<Mutex<GoshTransferEngine>>,
-}
-
-impl MyApp {
-    pub async fn new() -> Self {
-        let config = EngineConfig::default();
-        let (engine, events) = GoshTransferEngine::with_channel_events(config);
-        let engine = Arc::new(Mutex::new(engine));
-
-        // Start event handling
-        let engine_clone = engine.clone();
-        tokio::spawn(async move {
-            let mut events = events;
-            while let Ok(event) = events.recv().await {
-                // Update UI based on event
-                Self::handle_event(event).await;
-            }
-        });
-
-        // Start server
-        engine.lock().await.start_server().await.unwrap();
-
-        Self { engine }
-    }
-
-    async fn handle_event(event: EngineEvent) {
-        // Send to UI thread
-        match event {
-            EngineEvent::TransferRequest(t) => {
-                // Show approval dialog
-            }
-            EngineEvent::TransferProgress(p) => {
-                // Update progress bar
-            }
-            _ => {}
-        }
-    }
-
-    pub async fn send_files(&self, address: &str, files: Vec<PathBuf>) {
-        let engine = self.engine.lock().await;
-        if let Err(e) = engine.send_files(address, 53317, files).await {
-            // Show error dialog
-        }
-    }
-}
-```
-
 ## Types Reference
 
-### Protocol Types (`gosh_lan_transfer::protocol`)
+### Protocol Types
 
-These types cross the engine boundary (wire protocol or events).
+These types cross the engine boundary—they're either sent over HTTP or emitted as events.
 
-#### TransferFile
+**TransferFile** represents a single file in a transfer, with an ID, name, size, optional MIME type, and optional relative path for directory transfers.
 
-```rust
-pub struct TransferFile {
-    pub id: String,                    // UUID for this file
-    pub name: String,                  // Filename (no path)
-    pub size: u64,                     // Size in bytes
-    pub mime_type: Option<String>,     // MIME type if detected
-    pub relative_path: Option<String>, // Path within directory (for directory transfers)
-}
-```
+**TransferRequest** is the wire format for initiating a transfer, containing the transfer ID, sender name, file list, and total size.
 
-#### TransferRequest (Wire)
+**TransferResponse** comes back from the receiver, indicating whether the transfer was accepted and providing an upload token if so.
 
-```rust
-pub struct TransferRequest {
-    pub transfer_id: String,           // Unique transfer ID
-    pub sender_name: Option<String>,   // Sender's device name
-    pub files: Vec<TransferFile>,      // Files to transfer
-    pub total_size: u64,               // Total bytes
-}
-```
+**PendingTransfer** is the event payload for incoming transfer requests, adding the sender's IP and timestamp to the request data.
 
-#### TransferResponse (Wire)
+**TransferProgress** carries progress updates: transfer ID, current file name, bytes transferred, total bytes, and speed in bytes per second.
 
-```rust
-pub struct TransferResponse {
-    pub accepted: bool,            // Whether accepted
-    pub message: Option<String>,   // Message (e.g., rejection reason)
-    pub token: Option<String>,     // Upload token if accepted
-}
-```
+### Domain Types
 
-#### PendingTransfer (Event)
+These types stay within the local process.
 
-```rust
-pub struct PendingTransfer {
-    pub id: String,                      // Transfer ID
-    pub source_ip: String,               // Sender's IP
-    pub sender_name: Option<String>,     // Sender's device name
-    pub files: Vec<TransferFile>,        // Files to receive
-    pub total_size: u64,                 // Total bytes
-    pub received_at: DateTime<Utc>,      // When request arrived
-}
-```
+**Favorite** represents a saved peer with ID, display name, address, cached IP, and last-used timestamp.
 
-#### TransferProgress (Event)
+**TransferRecord** captures completed or failed transfer history: direction, status, peer address, file list, sizes, timestamps, and error message if applicable.
 
-```rust
-pub struct TransferProgress {
-    pub transfer_id: String,           // Transfer ID
-    pub current_file: Option<String>,  // Current filename
-    pub bytes_transferred: u64,        // Bytes sent/received
-    pub total_bytes: u64,              // Total bytes
-    pub speed_bps: u64,                // Speed in bytes/sec
-}
-```
+**NetworkInterface** describes a local network interface with its name, IP address, and loopback flag.
 
-#### Status Enums
-
-```rust
-pub enum TransferDirection { Sent, Received }
-pub enum TransferStatus { Pending, InProgress, Completed, Failed, Rejected }
-pub enum TransferDecision { Pending, Accepted, Rejected, NotFound }
-```
-
-### Domain Types (`gosh_lan_transfer::types`)
-
-These types are internal domain entities.
-
-#### Favorite
-
-```rust
-pub struct Favorite {
-    pub id: String,                          // UUID
-    pub name: String,                        // Display name
-    pub address: String,                     // Hostname or IP
-    pub last_resolved_ip: Option<String>,    // Cached IP
-    pub last_used: Option<DateTime<Utc>>,    // Last used time
-}
-```
-
-#### TransferRecord
-
-```rust
-pub struct TransferRecord {
-    pub id: String,
-    pub direction: TransferDirection,
-    pub status: TransferStatus,
-    pub peer_address: String,
-    pub files: Vec<TransferFile>,
-    pub total_size: u64,
-    pub bytes_transferred: u64,
-    pub started_at: DateTime<Utc>,
-    pub completed_at: Option<DateTime<Utc>>,
-    pub error: Option<String>,
-}
-```
-
-#### NetworkInterface
-
-```rust
-pub struct NetworkInterface {
-    pub name: String,      // Interface name (eth0, wlan0, etc.)
-    pub ip: String,        // IP address
-    pub is_loopback: bool, // Is loopback interface
-}
-```
-
-#### ResolveResult
-
-```rust
-pub struct ResolveResult {
-    pub hostname: String,        // Original hostname
-    pub ips: Vec<String>,        // Resolved IPs
-    pub success: bool,           // Resolution succeeded
-    pub error: Option<String>,   // Error message if failed
-}
-```
+**ResolveResult** holds DNS resolution results: the original hostname, resolved IPs, success flag, and error message if resolution failed.
 
 ## License
 
@@ -1020,4 +640,4 @@ MIT - See [LICENSE](LICENSE) for details.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit issues and pull requests.
+Contributions are welcome. Please feel free to submit issues and pull requests.

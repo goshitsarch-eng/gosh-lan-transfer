@@ -194,12 +194,21 @@ impl GoshTransferEngine {
     /// Accept a pending transfer
     ///
     /// Returns the token that the sender will use to upload files.
+    /// Requires the server to be running.
     pub async fn accept_transfer(&self, transfer_id: &str) -> EngineResult<String> {
+        if !self.is_server_running() {
+            return Err(EngineError::ServerNotRunning);
+        }
         self.server_state.accept_transfer(transfer_id).await
     }
 
     /// Reject a pending transfer
+    ///
+    /// Requires the server to be running.
     pub async fn reject_transfer(&self, transfer_id: &str) -> EngineResult<()> {
+        if !self.is_server_running() {
+            return Err(EngineError::ServerNotRunning);
+        }
         self.server_state.reject_transfer(transfer_id).await
     }
 
@@ -208,11 +217,24 @@ impl GoshTransferEngine {
         self.server_state.get_pending_transfers().await
     }
 
+    /// Cancel an in-progress transfer
+    ///
+    /// This will stop the transfer and emit a TransferFailed event.
+    /// Subsequent chunk uploads will be rejected.
+    pub async fn cancel_transfer(&self, transfer_id: &str) -> EngineResult<()> {
+        self.server_state.cancel_transfer(transfer_id).await
+    }
+
     // === Network Utilities ===
 
     /// Resolve a hostname or IP to all available addresses
     pub fn resolve_address(address: &str) -> ResolveResult {
         TransferClient::resolve_address(address)
+    }
+
+    /// Resolve a hostname or IP, returning an error if resolution fails
+    pub fn resolve_address_or_err(address: &str) -> EngineResult<Vec<String>> {
+        TransferClient::resolve_address_or_err(address)
     }
 
     /// Get all network interfaces with their IP addresses

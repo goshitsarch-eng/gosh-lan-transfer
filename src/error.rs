@@ -39,8 +39,8 @@ pub enum EngineError {
     #[error("Transfer timed out")]
     TransferTimeout,
 
-    #[error("Invalid token")]
-    InvalidToken,
+    #[error("Transfer cancelled")]
+    TransferCancelled,
 }
 
 /// Result alias for engine operations

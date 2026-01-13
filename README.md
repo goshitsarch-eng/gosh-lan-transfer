@@ -203,11 +203,10 @@ engine.send_files("192.168.1.100", 53317, files).await?;
 ```
 
 The send operation:
-1. Resolves the hostname to IP addresses
-2. Sends transfer metadata to the peer
-3. Waits for approval (up to 2 minutes)
-4. Streams each file with progress updates
-5. Emits `TransferComplete` or `TransferFailed` event
+1. Sends transfer metadata to the peer
+2. Waits for approval (up to 2 minutes)
+3. Streams each file with progress updates
+4. Emits `TransferComplete` or `TransferFailed` event
 
 #### Receiving Files
 
@@ -260,9 +259,11 @@ for iface in interfaces {
     }
 }
 
-// Check if a peer is reachable
-if engine.check_peer("192.168.1.100", 53317).await? {
-    println!("Peer is online");
+// Check if a peer is reachable (returns EngineResult<bool>)
+match engine.check_peer("192.168.1.100", 53317).await {
+    Ok(true) => println!("Peer is online"),
+    Ok(false) => println!("Peer returned error status"),
+    Err(e) => println!("Could not reach peer: {}", e),
 }
 
 // Get peer device info
@@ -547,7 +548,7 @@ The engine uses HTTP for all transfers. This ensures compatibility across firewa
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Health check, returns `{"status": "ok"}` |
+| `/health` | GET | Health check, returns `{"status": "ok", "app": "gosh-lan-transfer", "version": "..."}` |
 | `/info` | GET | Device info: name, version |
 | `/transfer` | POST | Initiate transfer request |
 | `/transfer/status` | GET | Check approval status |
@@ -789,9 +790,11 @@ pub struct TransferProgress {
     pub current_file: Option<String>,  // Current filename
     pub bytes_transferred: u64,        // Bytes sent/received
     pub total_bytes: u64,              // Total bytes
-    pub speed_bps: u64,                // Speed in bytes/sec
+    pub speed_bps: u64,                // Speed in bytes/sec (currently always 0)
 }
 ```
+
+> **Note**: The `speed_bps` field is defined but not currently calculated by the engine.
 
 #### Status Enums
 

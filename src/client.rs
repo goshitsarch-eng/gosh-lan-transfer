@@ -96,6 +96,18 @@ impl TransferClient {
         }
     }
 
+    /// Resolve a hostname or IP, returning an error if resolution fails
+    pub fn resolve_address_or_err(address: &str) -> EngineResult<Vec<String>> {
+        let result = Self::resolve_address(address);
+        if result.success {
+            Ok(result.ips)
+        } else {
+            Err(EngineError::DnsResolution(
+                result.error.unwrap_or_else(|| format!("Failed to resolve {}", address)),
+            ))
+        }
+    }
+
     /// Check if a peer is reachable by hitting the /health endpoint
     pub async fn check_peer(&self, address: &str, port: u16) -> EngineResult<bool> {
         let url = format!("http://{}:{}/health", address, port);
@@ -252,6 +264,7 @@ impl TransferClient {
         file_path: &Path,
         total_transfer_size: u64,
         bytes_sent_so_far: Arc<AtomicU64>,
+        transfer_start_time: Instant,
     ) -> EngineResult<()> {
         let url = format!(
             "http://{}:{}/chunk?transfer_id={}&file_id={}&token={}",
@@ -282,6 +295,7 @@ impl TransferClient {
             let file_name = file_name.clone();
             let bytes_sent = bytes_sent_so_far.clone();
             let last_update = last_update.clone();
+            let start_time = transfer_start_time;
 
             move |chunk_result| {
                 if let Ok(chunk) = chunk_result {
@@ -292,12 +306,21 @@ impl TransferClient {
                     // Throttle updates to every 32KB to avoid flooding
                     if new_total - last >= 32768 || new_total == total_transfer_size {
                         last_update.store(new_total, Ordering::SeqCst);
+
+                        // Calculate speed based on elapsed time
+                        let elapsed_secs = start_time.elapsed().as_secs_f64();
+                        let speed_bps = if elapsed_secs > 0.0 {
+                            (new_total as f64 / elapsed_secs) as u64
+                        } else {
+                            0
+                        };
+
                         event_handler.on_event(EngineEvent::TransferProgress(TransferProgress {
                             transfer_id: transfer_id.clone(),
                             current_file: Some(file_name.clone()),
                             bytes_transferred: new_total,
                             total_bytes: total_transfer_size,
-                            speed_bps: 0,
+                            speed_bps,
                         }));
                     }
                 }
@@ -325,12 +348,18 @@ impl TransferClient {
 
         // Send final progress update for this file
         let final_bytes = bytes_sent_so_far.load(Ordering::SeqCst);
+        let elapsed_secs = transfer_start_time.elapsed().as_secs_f64();
+        let speed_bps = if elapsed_secs > 0.0 {
+            (final_bytes as f64 / elapsed_secs) as u64
+        } else {
+            0
+        };
         self.event_handler.on_event(EngineEvent::TransferProgress(TransferProgress {
             transfer_id: transfer_id_owned,
             current_file: Some(file_name),
             bytes_transferred: final_bytes,
             total_bytes: total_transfer_size,
-            speed_bps: 0,
+            speed_bps,
         }));
 
         Ok(())
@@ -392,6 +421,7 @@ impl TransferClient {
         // Calculate total transfer size
         let total_transfer_size: u64 = files.iter().map(|f| f.size).sum();
         let bytes_sent_so_far = Arc::new(AtomicU64::new(0));
+        let transfer_start_time = Instant::now();
 
         // Send each file
         for (file, path) in files.iter().zip(file_paths.iter()) {
@@ -404,6 +434,7 @@ impl TransferClient {
                 path,
                 total_transfer_size,
                 bytes_sent_so_far.clone(),
+                transfer_start_time,
             )
             .await?;
 

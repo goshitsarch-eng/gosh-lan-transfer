@@ -47,8 +47,14 @@ pub struct ServerState {
     pub approved_tokens: RwLock<HashMap<String, String>>,
     /// Rejected transfers (transfer_id -> reason)
     pub rejected_transfers: RwLock<HashMap<String, String>>,
+    /// Cancelled transfers (transfer_id)
+    pub cancelled_transfers: RwLock<HashSet<String>>,
     /// Received files per transfer (transfer_id -> set of file_ids)
     pub received_files: RwLock<HashMap<String, HashSet<String>>>,
+    /// Bytes received per transfer (transfer_id -> total bytes received so far)
+    pub transfer_bytes: RwLock<HashMap<String, u64>>,
+    /// Transfer start times (transfer_id -> start instant)
+    pub transfer_start_times: RwLock<HashMap<String, std::time::Instant>>,
     /// Channel for internal SSE events
     internal_event_tx: broadcast::Sender<InternalEvent>,
     /// Event handler for engine events
@@ -82,7 +88,10 @@ impl ServerState {
             pending_transfers: RwLock::new(HashMap::new()),
             approved_tokens: RwLock::new(HashMap::new()),
             rejected_transfers: RwLock::new(HashMap::new()),
+            cancelled_transfers: RwLock::new(HashSet::new()),
             received_files: RwLock::new(HashMap::new()),
+            transfer_bytes: RwLock::new(HashMap::new()),
+            transfer_start_times: RwLock::new(HashMap::new()),
             internal_event_tx,
             event_handler,
         }
@@ -148,6 +157,46 @@ impl ServerState {
         self.approved_tokens.write().await.remove(transfer_id);
 
         Ok(())
+    }
+
+    /// Cancel an in-progress transfer
+    ///
+    /// This will cause subsequent chunk uploads to be rejected.
+    pub async fn cancel_transfer(&self, transfer_id: &str) -> EngineResult<()> {
+        // Check if transfer exists (either pending or approved)
+        let pending = self.pending_transfers.read().await;
+        let approved = self.approved_tokens.read().await;
+        if !pending.contains_key(transfer_id) && !approved.contains_key(transfer_id) {
+            return Err(EngineError::TransferNotFound(transfer_id.to_string()));
+        }
+        drop(pending);
+        drop(approved);
+
+        // Mark as cancelled
+        self.cancelled_transfers
+            .write()
+            .await
+            .insert(transfer_id.to_string());
+
+        // Clean up the transfer state
+        self.pending_transfers.write().await.remove(transfer_id);
+        self.approved_tokens.write().await.remove(transfer_id);
+        self.received_files.write().await.remove(transfer_id);
+        self.transfer_bytes.write().await.remove(transfer_id);
+        self.transfer_start_times.write().await.remove(transfer_id);
+
+        // Emit cancellation event
+        self.emit_event(EngineEvent::TransferFailed {
+            transfer_id: transfer_id.to_string(),
+            error: "Transfer cancelled".to_string(),
+        });
+
+        Ok(())
+    }
+
+    /// Check if a transfer has been cancelled
+    pub async fn is_transfer_cancelled(&self, transfer_id: &str) -> bool {
+        self.cancelled_transfers.read().await.contains(transfer_id)
     }
 
     /// Get all pending transfers
@@ -415,6 +464,14 @@ async fn chunk_upload_handler(
     Query(params): Query<ChunkParams>,
     body: Body,
 ) -> impl IntoResponse {
+    // Check if transfer was cancelled
+    if state.is_transfer_cancelled(&params.transfer_id).await {
+        return (
+            StatusCode::GONE,
+            Json(serde_json::json!({"error": "Transfer was cancelled"})),
+        );
+    }
+
     // Verify the token
     let approved = state.approved_tokens.read().await;
     let expected_token = approved.get(&params.transfer_id);
@@ -477,9 +534,18 @@ async fn chunk_upload_handler(
         .unwrap_or(&safe_name)
         .to_string();
 
+    // Initialize or get transfer start time and cumulative bytes
+    {
+        let mut start_times = state.transfer_start_times.write().await;
+        start_times
+            .entry(params.transfer_id.clone())
+            .or_insert_with(std::time::Instant::now);
+    }
+
     // Stream the body to the file
     let mut bytes_received: u64 = 0;
     let mut stream = body.into_data_stream();
+    let mut last_progress_bytes: u64 = 0;
 
     while let Some(chunk) = stream.next().await {
         match chunk {
@@ -508,14 +574,45 @@ async fn chunk_upload_handler(
 
                 bytes_received = next_size;
 
-                // Send progress update
-                state.emit_event(EngineEvent::TransferProgress(TransferProgress {
-                    transfer_id: params.transfer_id.clone(),
-                    current_file: Some(stored_name.clone()),
-                    bytes_transferred: bytes_received,
-                    total_bytes: file_info.size,
-                    speed_bps: 0,
-                }));
+                // Update cumulative transfer bytes
+                {
+                    let mut transfer_bytes = state.transfer_bytes.write().await;
+                    let total = transfer_bytes.entry(params.transfer_id.clone()).or_insert(0);
+                    *total += data.len() as u64;
+                }
+
+                // Throttle progress updates to every 32KB
+                if bytes_received - last_progress_bytes >= 32768 || bytes_received == file_info.size {
+                    last_progress_bytes = bytes_received;
+
+                    // Calculate speed based on elapsed time
+                    let speed_bps = {
+                        let start_times = state.transfer_start_times.read().await;
+                        let transfer_bytes = state.transfer_bytes.read().await;
+                        if let (Some(start_time), Some(&total_bytes)) = (
+                            start_times.get(&params.transfer_id),
+                            transfer_bytes.get(&params.transfer_id),
+                        ) {
+                            let elapsed_secs = start_time.elapsed().as_secs_f64();
+                            if elapsed_secs > 0.0 {
+                                (total_bytes as f64 / elapsed_secs) as u64
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        }
+                    };
+
+                    // Send progress update
+                    state.emit_event(EngineEvent::TransferProgress(TransferProgress {
+                        transfer_id: params.transfer_id.clone(),
+                        current_file: Some(stored_name.clone()),
+                        bytes_transferred: bytes_received,
+                        total_bytes: file_info.size,
+                        speed_bps,
+                    }));
+                }
             }
             Err(e) => {
                 tracing::error!("Error reading chunk: {}", e);
@@ -592,6 +689,8 @@ async fn chunk_upload_handler(
             state.pending_transfers.write().await.remove(&transfer_id);
             state.approved_tokens.write().await.remove(&transfer_id);
             state.received_files.write().await.remove(&transfer_id);
+            state.transfer_bytes.write().await.remove(&transfer_id);
+            state.transfer_start_times.write().await.remove(&transfer_id);
         }
     }
 

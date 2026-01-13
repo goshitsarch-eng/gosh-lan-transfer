@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Transfer cancellation via `cancel_transfer()` method
+- Speed calculation (`speed_bps`) in `TransferProgress` events
+- IPv6 dual-stack support with automatic fallback to IPv4
+- `resolve_address_or_err()` method for DNS resolution with error handling
+- `TransferCancelled` error variant
+
+### Changed
+
+- `accept_transfer()` and `reject_transfer()` now return `ServerNotRunning` error if server is not running
+- Server now binds to `[::]` (IPv6) first, falling back to `0.0.0.0` (IPv4) if unavailable
+- Progress events now include actual transfer speed
+
+### Removed
+
+- `InvalidToken` error variant (HTTP 401 responses used instead)
+
 ## [0.1.0] - 2024-01-01
 
 ### Added

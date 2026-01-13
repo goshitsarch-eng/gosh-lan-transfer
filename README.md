@@ -242,14 +242,25 @@ for transfer in pending {
 }
 ```
 
+#### Cancelling Transfers
+
+```rust
+// Cancel an in-progress transfer
+engine.cancel_transfer(&transfer.id).await?;
+// This emits a TransferFailed event and rejects further uploads
+```
+
 #### Network Utilities
 
 ```rust
-// Resolve hostname to IPs
+// Resolve hostname to IPs (returns ResolveResult)
 let result = GoshTransferEngine::resolve_address("mypc.local");
 if result.success {
     println!("Resolved to: {:?}", result.ips);
 }
+
+// Or use the error-returning variant
+let ips = GoshTransferEngine::resolve_address_or_err("mypc.local")?;
 
 // Get all network interfaces
 let interfaces = GoshTransferEngine::get_network_interfaces();
@@ -533,12 +544,12 @@ Error variants:
 - `TransferRejected` - Peer rejected the transfer
 - `TransferTimeout` - Approval timeout (2 minutes)
 - `TransferNotFound(String)` - Transfer ID not found
+- `TransferCancelled` - Transfer was cancelled
 - `FileIo(String)` - File read/write error
 - `Serialization(String)` - JSON serialization error
 - `ServerNotRunning` - Server not started
 - `ServerAlreadyRunning` - Server already running
 - `InvalidConfig(String)` - Configuration error
-- `InvalidToken` - Invalid upload token
 
 ## Transfer Protocol
 
@@ -790,11 +801,9 @@ pub struct TransferProgress {
     pub current_file: Option<String>,  // Current filename
     pub bytes_transferred: u64,        // Bytes sent/received
     pub total_bytes: u64,              // Total bytes
-    pub speed_bps: u64,                // Speed in bytes/sec (currently always 0)
+    pub speed_bps: u64,                // Speed in bytes/sec
 }
 ```
-
-> **Note**: The `speed_bps` field is defined but not currently calculated by the engine.
 
 #### Status Enums
 

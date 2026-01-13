@@ -36,7 +36,7 @@ gosh-lan-transfer is a Rust library that enables peer-to-peer file transfers ove
 | FR-2 | Receive files from peers with approval workflow | Must Have |
 | FR-3 | Auto-accept transfers from configured trusted hosts | Must Have |
 | FR-4 | Track transfer progress with byte-level granularity | Must Have |
-| FR-5 | Cancel in-progress transfers | Should Have (not implemented) |
+| FR-5 | Cancel in-progress transfers | Should Have |
 | FR-6 | Resume interrupted transfers | Could Have (not implemented) |
 
 ### Server Operations

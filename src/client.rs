@@ -35,6 +35,19 @@ pub struct TransferClient {
     event_handler: Arc<dyn EventHandler>,
 }
 
+/// Parameters for sending a single file
+struct SendFileParams<'a> {
+    address: &'a str,
+    port: u16,
+    transfer_id: &'a str,
+    token: &'a str,
+    file_id: &'a str,
+    file_path: &'a Path,
+    total_transfer_size: u64,
+    bytes_sent_so_far: Arc<AtomicU64>,
+    transfer_start_time: Instant,
+}
+
 impl TransferClient {
     /// Create a new transfer client with the given event handler
     pub fn new(event_handler: Arc<dyn EventHandler>) -> Self {
@@ -254,25 +267,14 @@ impl TransferClient {
     }
 
     /// Send a file to a peer (after transfer is accepted)
-    pub async fn send_file(
-        &self,
-        address: &str,
-        port: u16,
-        transfer_id: &str,
-        token: &str,
-        file_id: &str,
-        file_path: &Path,
-        total_transfer_size: u64,
-        bytes_sent_so_far: Arc<AtomicU64>,
-        transfer_start_time: Instant,
-    ) -> EngineResult<()> {
+    async fn send_file(&self, params: SendFileParams<'_>) -> EngineResult<()> {
         let url = format!(
             "http://{}:{}/chunk?transfer_id={}&file_id={}&token={}",
-            address, port, transfer_id, file_id, token
+            params.address, params.port, params.transfer_id, params.file_id, params.token
         );
 
         // Open and read the file
-        let file = File::open(file_path)
+        let file = File::open(params.file_path)
             .await
             .map_err(|e| EngineError::FileIo(format!("Failed to open file: {}", e)))?;
 
@@ -285,17 +287,18 @@ impl TransferClient {
 
         // Create progress-tracking stream
         let event_handler = self.event_handler.clone();
-        let transfer_id_owned = transfer_id.to_string();
-        let file_name = file_path.file_name().unwrap().to_string_lossy().to_string();
+        let transfer_id_owned = params.transfer_id.to_string();
+        let file_name = params.file_path.file_name().unwrap().to_string_lossy().to_string();
         let last_update = Arc::new(AtomicU64::new(0));
+        let total_transfer_size = params.total_transfer_size;
 
         let stream = ReaderStream::new(file).inspect({
             let event_handler = event_handler.clone();
             let transfer_id = transfer_id_owned.clone();
             let file_name = file_name.clone();
-            let bytes_sent = bytes_sent_so_far.clone();
+            let bytes_sent = params.bytes_sent_so_far.clone();
             let last_update = last_update.clone();
-            let start_time = transfer_start_time;
+            let start_time = params.transfer_start_time;
 
             move |chunk_result| {
                 if let Ok(chunk) = chunk_result {
@@ -347,8 +350,8 @@ impl TransferClient {
         }
 
         // Send final progress update for this file
-        let final_bytes = bytes_sent_so_far.load(Ordering::SeqCst);
-        let elapsed_secs = transfer_start_time.elapsed().as_secs_f64();
+        let final_bytes = params.bytes_sent_so_far.load(Ordering::SeqCst);
+        let elapsed_secs = params.transfer_start_time.elapsed().as_secs_f64();
         let speed_bps = if elapsed_secs > 0.0 {
             (final_bytes as f64 / elapsed_secs) as u64
         } else {
@@ -425,17 +428,17 @@ impl TransferClient {
 
         // Send each file
         for (file, path) in files.iter().zip(file_paths.iter()) {
-            self.send_file(
+            self.send_file(SendFileParams {
                 address,
                 port,
-                &transfer_id,
-                &token,
-                &file.id,
-                path,
+                transfer_id: &transfer_id,
+                token: &token,
+                file_id: &file.id,
+                file_path: path,
                 total_transfer_size,
-                bytes_sent_so_far.clone(),
+                bytes_sent_so_far: bytes_sent_so_far.clone(),
                 transfer_start_time,
-            )
+            })
             .await?;
 
             tracing::info!("Sent file: {}", file.name);

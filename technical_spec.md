@@ -193,7 +193,7 @@ struct TransferRecord {
 
 4. **Unique filename handling**: The receiver generates unique filenames using `(n)` suffix pattern when conflicts occur, testing up to 1000 variations.
 
-5. **Speed calculation**: The `speed_bps` field in `TransferProgress` is currently always set to 0. Speed calculation is not implemented.
+5. **Speed calculation**: Transfer speed is calculated as total bytes transferred divided by elapsed time since transfer start.
 
 ## Security Considerations
 
@@ -212,8 +212,9 @@ struct TransferRecord {
 ### Network
 
 - TCP port 53317 (default, configurable)
-- Server binds to 0.0.0.0 (all interfaces)
+- Server binds to [::] (IPv6 dual-stack) with fallback to 0.0.0.0 (IPv4)
 - Works across LAN, Tailscale, and VPN networks
+- Supports both IPv4 and IPv6 clients
 
 ### Filesystem
 

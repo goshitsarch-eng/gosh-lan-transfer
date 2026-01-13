@@ -169,15 +169,10 @@ pub enum EngineEvent {
     TransferProgress(TransferProgress),
 
     /// Transfer completed successfully
-    TransferComplete {
-        transfer_id: String,
-    },
+    TransferComplete { transfer_id: String },
 
     /// Transfer failed
-    TransferFailed {
-        transfer_id: String,
-        error: String,
-    },
+    TransferFailed { transfer_id: String, error: String },
 
     /// Retrying a failed operation
     TransferRetry {
@@ -191,10 +186,11 @@ pub enum EngineEvent {
     },
 
     /// Server started successfully
-    ServerStarted {
-        port: u16,
-    },
+    ServerStarted { port: u16 },
 
     /// Server stopped
     ServerStopped,
+
+    /// Server port changed at runtime
+    PortChanged { old_port: u16, new_port: u16 },
 }

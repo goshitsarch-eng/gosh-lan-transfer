@@ -117,7 +117,9 @@ impl EventHandler for NoopEventHandler {
 }
 
 /// Helper function to create an Arc-wrapped channel event handler
-pub fn channel_handler(capacity: usize) -> (Arc<ChannelEventHandler>, broadcast::Receiver<EngineEvent>) {
+pub fn channel_handler(
+    capacity: usize,
+) -> (Arc<ChannelEventHandler>, broadcast::Receiver<EngineEvent>) {
     let (handler, receiver) = ChannelEventHandler::new(capacity);
     (Arc::new(handler), receiver)
 }

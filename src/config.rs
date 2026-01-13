@@ -135,7 +135,9 @@ impl EngineConfigBuilder {
             receive_only: self.receive_only.unwrap_or(default.receive_only),
             max_retries: self.max_retries.unwrap_or(default.max_retries),
             retry_delay_ms: self.retry_delay_ms.unwrap_or(default.retry_delay_ms),
-            bandwidth_limit_bps: self.bandwidth_limit_bps.unwrap_or(default.bandwidth_limit_bps),
+            bandwidth_limit_bps: self
+                .bandwidth_limit_bps
+                .unwrap_or(default.bandwidth_limit_bps),
         }
     }
 }

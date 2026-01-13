@@ -125,9 +125,16 @@ impl GoshTransferEngine {
         event_handler: Arc<dyn EventHandler>,
         history: Arc<dyn HistoryPersistence>,
     ) -> Self {
-        let server_state =
-            Arc::new(ServerState::new_with_history(config.clone(), event_handler.clone(), history.clone()));
-        let client = TransferClient::new_with_history_and_config(event_handler.clone(), history.clone(), &config);
+        let server_state = Arc::new(ServerState::new_with_history(
+            config.clone(),
+            event_handler.clone(),
+            history.clone(),
+        ));
+        let client = TransferClient::new_with_history_and_config(
+            event_handler.clone(),
+            history.clone(),
+            &config,
+        );
 
         Self {
             config,
@@ -201,6 +208,138 @@ impl GoshTransferEngine {
     /// Get the server state for advanced operations
     pub fn server_state(&self) -> &Arc<ServerState> {
         &self.server_state
+    }
+
+    /// Get the current server port
+    pub fn port(&self) -> u16 {
+        self.config.port
+    }
+
+    /// Change the server port at runtime
+    ///
+    /// This will gracefully stop the current server, bind to the new port,
+    /// and emit appropriate events. If binding to the new port fails,
+    /// it will attempt to restore the previous port.
+    ///
+    /// # Arguments
+    /// * `new_port` - The new port to bind to
+    ///
+    /// # Errors
+    /// * `EngineError::InvalidConfig` if the port is invalid (e.g., port 0)
+    /// * `EngineError::Network` if binding to the new port fails
+    pub async fn change_port(&mut self, new_port: u16) -> EngineResult<()> {
+        self.change_port_with_options(new_port, true).await
+    }
+
+    /// Change the server port with configurable rollback behavior
+    ///
+    /// # Arguments
+    /// * `new_port` - The new port to bind to
+    /// * `rollback_on_failure` - If true, attempt to restore the old port if new binding fails
+    ///
+    /// # Behavior
+    /// 1. Validates the new port
+    /// 2. If server is running, stops it gracefully
+    /// 3. Attempts to bind to the new port
+    /// 4. On success: updates config, emits `PortChanged` and `ServerStarted` events
+    /// 5. On failure with rollback: attempts to restore old port
+    /// 6. On failure without rollback: leaves server stopped
+    pub async fn change_port_with_options(
+        &mut self,
+        new_port: u16,
+        rollback_on_failure: bool,
+    ) -> EngineResult<()> {
+        // Validate the new port
+        Self::validate_port(new_port)?;
+
+        let old_port = self.config.port;
+
+        // No-op if port hasn't changed
+        if old_port == new_port {
+            tracing::debug!("Port unchanged ({}), skipping restart", new_port);
+            return Ok(());
+        }
+
+        let was_running = self.is_server_running();
+
+        // Stop the current server if running
+        if was_running {
+            self.stop_server().await?;
+        }
+
+        // Update config with new port
+        self.config.port = new_port;
+        self.server_state.update_config(self.config.clone()).await;
+
+        // Attempt to start on new port
+        if was_running {
+            match self.start_server().await {
+                Ok(()) => {
+                    // Success - emit port changed event
+                    self.event_handler
+                        .on_event(EngineEvent::PortChanged { old_port, new_port });
+                    tracing::info!("Server port changed from {} to {}", old_port, new_port);
+                    Ok(())
+                }
+                Err(e) => {
+                    tracing::error!("Failed to bind to new port {}: {}", new_port, e);
+
+                    if rollback_on_failure {
+                        tracing::info!("Attempting to restore previous port {}", old_port);
+
+                        // Restore old port in config
+                        self.config.port = old_port;
+                        self.server_state.update_config(self.config.clone()).await;
+
+                        // Try to restart on old port
+                        if let Err(restore_err) = self.start_server().await {
+                            tracing::error!(
+                                "Failed to restore old port {}: {}",
+                                old_port,
+                                restore_err
+                            );
+                            // Return the original error, not the restore error
+                            return Err(EngineError::Network(format!(
+                                "Port change failed and rollback failed: original error: {}, rollback error: {}",
+                                e, restore_err
+                            )));
+                        }
+
+                        // Rollback succeeded, return the original error
+                        Err(EngineError::Network(format!(
+                            "Failed to bind to port {}: {} (restored to port {})",
+                            new_port, e, old_port
+                        )))
+                    } else {
+                        // No rollback - config already updated, server stopped
+                        Err(e)
+                    }
+                }
+            }
+        } else {
+            // Server wasn't running, just update config
+            self.event_handler
+                .on_event(EngineEvent::PortChanged { old_port, new_port });
+            Ok(())
+        }
+    }
+
+    /// Validate a port number for runtime changes
+    fn validate_port(port: u16) -> EngineResult<()> {
+        if port == 0 {
+            return Err(EngineError::InvalidConfig(
+                "Port 0 (auto-assign) is not supported; specify an explicit port".to_string(),
+            ));
+        }
+
+        if port < 1024 {
+            tracing::warn!(
+                "Port {} is privileged and may require elevated permissions",
+                port
+            );
+        }
+
+        Ok(())
     }
 
     // === Transfer Operations ===
@@ -410,5 +549,141 @@ impl Drop for GoshTransferEngine {
         if let Some(handle) = self.server_handle.take() {
             handle.shutdown();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to find an available port
+    async fn find_available_port() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    #[tokio::test]
+    async fn test_change_port_not_running() {
+        let config = EngineConfig::builder()
+            .port(53317)
+            .device_name("Test")
+            .download_dir("/tmp")
+            .build();
+
+        let (mut engine, mut rx) = GoshTransferEngine::with_channel_events(config);
+
+        // Change port when not running
+        engine.change_port(53318).await.unwrap();
+
+        assert_eq!(engine.port(), 53318);
+
+        // Should receive PortChanged event
+        let event = rx.try_recv().unwrap();
+        match event {
+            EngineEvent::PortChanged { old_port, new_port } => {
+                assert_eq!(old_port, 53317);
+                assert_eq!(new_port, 53318);
+            }
+            _ => panic!("Expected PortChanged event, got {:?}", event),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_change_port_while_running() {
+        let port1 = find_available_port().await;
+        let port2 = find_available_port().await;
+
+        let config = EngineConfig::builder()
+            .port(port1)
+            .device_name("Test")
+            .download_dir("/tmp")
+            .build();
+
+        let (mut engine, _rx) = GoshTransferEngine::with_channel_events(config);
+
+        engine.start_server().await.unwrap();
+        assert!(engine.is_server_running());
+
+        engine.change_port(port2).await.unwrap();
+
+        assert_eq!(engine.port(), port2);
+        assert!(engine.is_server_running());
+
+        engine.stop_server().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_change_port_same_port_noop() {
+        let config = EngineConfig::builder()
+            .port(53317)
+            .device_name("Test")
+            .download_dir("/tmp")
+            .build();
+
+        let (mut engine, mut rx) = GoshTransferEngine::with_channel_events(config);
+
+        // Should be a no-op
+        engine.change_port(53317).await.unwrap();
+        assert_eq!(engine.port(), 53317);
+
+        // No event should be emitted
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_change_port_invalid_zero() {
+        let config = EngineConfig::builder()
+            .port(53317)
+            .device_name("Test")
+            .download_dir("/tmp")
+            .build();
+
+        let (mut engine, _rx) = GoshTransferEngine::with_channel_events(config);
+
+        let result = engine.change_port(0).await;
+        assert!(matches!(result, Err(EngineError::InvalidConfig(_))));
+    }
+
+    #[tokio::test]
+    async fn test_change_port_rollback_on_failure() {
+        let port1 = find_available_port().await;
+
+        let config = EngineConfig::builder()
+            .port(port1)
+            .device_name("Test")
+            .download_dir("/tmp")
+            .build();
+
+        let (mut engine, _rx) = GoshTransferEngine::with_channel_events(config);
+
+        engine.start_server().await.unwrap();
+
+        // Bind to both IPv4 and IPv6 to block the port completely
+        let blocked_port = find_available_port().await;
+        let _blocker_v4 = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", blocked_port))
+            .await
+            .unwrap();
+        let _blocker_v6 = tokio::net::TcpListener::bind(format!("[::]:{}", blocked_port)).await;
+
+        // Attempt to change to the blocked port
+        let result = engine.change_port(blocked_port).await;
+        assert!(result.is_err());
+
+        // Port value should be restored (rollback)
+        assert_eq!(engine.port(), port1);
+
+        engine.stop_server().await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_port_getter() {
+        let config = EngineConfig::builder()
+            .port(12345)
+            .device_name("Test")
+            .download_dir("/tmp")
+            .build();
+
+        let (engine, _rx) = GoshTransferEngine::with_channel_events(config);
+        assert_eq!(engine.port(), 12345);
     }
 }

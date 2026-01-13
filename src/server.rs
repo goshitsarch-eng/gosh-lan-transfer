@@ -69,8 +69,12 @@ pub struct ServerState {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum InternalEvent {
-    TransferRequest { transfer: PendingTransfer },
-    Progress { progress: TransferProgress },
+    TransferRequest {
+        transfer: PendingTransfer,
+    },
+    Progress {
+        progress: TransferProgress,
+    },
     TransferComplete {
         #[serde(rename = "transferId")]
         transfer_id: String,
@@ -79,6 +83,12 @@ enum InternalEvent {
         #[serde(rename = "transferId")]
         transfer_id: String,
         error: String,
+    },
+    PortChanged {
+        #[serde(rename = "oldPort")]
+        old_port: u16,
+        #[serde(rename = "newPort")]
+        new_port: u16,
     },
 }
 
@@ -140,6 +150,9 @@ impl ServerState {
             EngineEvent::TransferFailed { transfer_id, error } => {
                 InternalEvent::TransferFailed { transfer_id, error }
             }
+            EngineEvent::PortChanged { old_port, new_port } => {
+                InternalEvent::PortChanged { old_port, new_port }
+            }
             _ => return, // Don't send server start/stop events to SSE
         };
         let _ = self.internal_event_tx.send(internal);
@@ -187,10 +200,7 @@ impl ServerState {
             .write()
             .await
             .insert(transfer_id.to_string(), token.clone());
-        self.rejected_transfers
-            .write()
-            .await
-            .remove(transfer_id);
+        self.rejected_transfers.write().await.remove(transfer_id);
 
         Ok(token)
     }
@@ -229,7 +239,12 @@ impl ServerState {
         drop(approved);
 
         // Get bytes transferred so far
-        let bytes_transferred = *self.transfer_bytes.read().await.get(transfer_id).unwrap_or(&0);
+        let bytes_transferred = *self
+            .transfer_bytes
+            .read()
+            .await
+            .get(transfer_id)
+            .unwrap_or(&0);
 
         // Mark as cancelled
         self.cancelled_transfers
@@ -577,7 +592,9 @@ async fn chunk_upload_handler(
         tracing::error!("Failed to create download directory: {}", e);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to create download directory: {}", e)})),
+            Json(
+                serde_json::json!({"error": format!("Failed to create download directory: {}", e)}),
+            ),
         );
     }
 
@@ -616,7 +633,9 @@ async fn chunk_upload_handler(
                 tracing::error!("Failed to create directory structure: {}", e);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("Failed to create directories: {}", e)})),
+                    Json(
+                        serde_json::json!({"error": format!("Failed to create directories: {}", e)}),
+                    ),
                 );
             }
         }
@@ -677,10 +696,7 @@ async fn chunk_upload_handler(
             Ok(data) => {
                 let next_size = bytes_received + data.len() as u64;
                 if next_size > file_info.size {
-                    tracing::error!(
-                        "Received more data than expected for {}",
-                        file_info.name
-                    );
+                    tracing::error!("Received more data than expected for {}", file_info.name);
                     drop(file);
                     let _ = tokio::fs::remove_file(&file_path).await;
                     return (
@@ -702,12 +718,15 @@ async fn chunk_upload_handler(
                 // Update cumulative transfer bytes
                 {
                     let mut transfer_bytes = state.transfer_bytes.write().await;
-                    let total = transfer_bytes.entry(params.transfer_id.clone()).or_insert(0);
+                    let total = transfer_bytes
+                        .entry(params.transfer_id.clone())
+                        .or_insert(0);
                     *total += data.len() as u64;
                 }
 
                 // Throttle progress updates to every 32KB
-                if bytes_received - last_progress_bytes >= 32768 || bytes_received == file_info.size {
+                if bytes_received - last_progress_bytes >= 32768 || bytes_received == file_info.size
+                {
                     last_progress_bytes = bytes_received;
 
                     // Calculate speed based on elapsed time
@@ -803,7 +822,12 @@ async fn chunk_upload_handler(
 
             // Record to history before cleanup (clone transfer info)
             let transfer_clone = transfer.clone();
-            let total_bytes = *state.transfer_bytes.read().await.get(&transfer_id).unwrap_or(&transfer.total_size);
+            let total_bytes = *state
+                .transfer_bytes
+                .read()
+                .await
+                .get(&transfer_id)
+                .unwrap_or(&transfer.total_size);
 
             // Emit completion event
             state.emit_event(EngineEvent::TransferComplete {
@@ -811,7 +835,12 @@ async fn chunk_upload_handler(
             });
 
             // Record to history
-            state.record_receive_history(&transfer_clone, TransferStatus::Completed, total_bytes, None);
+            state.record_receive_history(
+                &transfer_clone,
+                TransferStatus::Completed,
+                total_bytes,
+                None,
+            );
 
             // Clean up transfer state (drop the read lock first)
             drop(pending);
@@ -822,7 +851,11 @@ async fn chunk_upload_handler(
             state.approved_tokens.write().await.remove(&transfer_id);
             state.received_files.write().await.remove(&transfer_id);
             state.transfer_bytes.write().await.remove(&transfer_id);
-            state.transfer_start_times.write().await.remove(&transfer_id);
+            state
+                .transfer_start_times
+                .write()
+                .await
+                .remove(&transfer_id);
         }
     }
 
@@ -839,8 +872,9 @@ async fn chunk_upload_handler(
 /// SSE endpoint for real-time transfer events
 async fn events_handler(
     State(state): State<Arc<ServerState>>,
-) -> Sse<impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>>
-{
+) -> Sse<
+    impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+> {
     let rx = state.internal_event_tx.subscribe();
 
     let stream = BroadcastStream::new(rx).map(|result: Result<InternalEvent, _>| {
@@ -861,10 +895,7 @@ async fn events_handler(
 }
 
 /// Start the HTTP server and return a handle for controlling it
-pub async fn start_server(
-    state: Arc<ServerState>,
-    port: u16,
-) -> EngineResult<ServerHandle> {
+pub async fn start_server(state: Arc<ServerState>, port: u16) -> EngineResult<ServerHandle> {
     let app = create_router(state.clone());
 
     tracing::info!("Starting server on port {}", port);
@@ -881,9 +912,9 @@ pub async fn start_server(
         }
         Err(e) => {
             tracing::debug!("IPv6 bind failed ({}), falling back to IPv4", e);
-            tokio::net::TcpListener::bind(addr_v4)
-                .await
-                .map_err(|e| EngineError::Network(format!("Failed to bind to port {}: {}", port, e)))?
+            tokio::net::TcpListener::bind(addr_v4).await.map_err(|e| {
+                EngineError::Network(format!("Failed to bind to port {}: {}", port, e))
+            })?
         }
     };
 
@@ -903,7 +934,9 @@ pub async fn start_server(
     });
 
     // Emit server started event
-    state.event_handler.on_event(EngineEvent::ServerStarted { port });
+    state
+        .event_handler
+        .on_event(EngineEvent::ServerStarted { port });
 
     Ok(ServerHandle { shutdown_tx })
 }

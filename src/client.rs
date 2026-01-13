@@ -12,7 +12,9 @@ use crate::protocol::{
     EngineEvent, TransferApprovalStatus, TransferDecision, TransferFile, TransferProgress,
     TransferRequest, TransferResponse,
 };
-use crate::types::{NetworkInterface, ResolveResult, TransferDirection, TransferRecord, TransferStatus};
+use crate::types::{
+    NetworkInterface, ResolveResult, TransferDirection, TransferRecord, TransferStatus,
+};
 use futures::StreamExt;
 use reqwest::{Body, Client};
 use std::{
@@ -175,9 +177,9 @@ impl TransferClient {
         if result.success {
             Ok(result.ips)
         } else {
-            Err(EngineError::DnsResolution(
-                result.error.unwrap_or_else(|| format!("Failed to resolve {}", address)),
-            ))
+            Err(EngineError::DnsResolution(result.error.unwrap_or_else(
+                || format!("Failed to resolve {}", address),
+            )))
         }
     }
 
@@ -257,10 +259,10 @@ impl TransferClient {
 
             match result {
                 Ok(response) => {
-                    let transfer_response: TransferResponse = response
-                        .json()
-                        .await
-                        .map_err(|e| EngineError::Serialization(format!("Failed to parse response: {}", e)))?;
+                    let transfer_response: TransferResponse =
+                        response.json().await.map_err(|e| {
+                            EngineError::Serialization(format!("Failed to parse response: {}", e))
+                        })?;
                     return Ok(transfer_response);
                 }
                 Err(e) => {
@@ -313,12 +315,9 @@ impl TransferClient {
         let started = Instant::now();
 
         loop {
-            let response = self
-                .http_client
-                .get(&url)
-                .send()
-                .await
-                .map_err(|e| EngineError::Network(format!("Failed to check transfer status: {}", e)))?;
+            let response = self.http_client.get(&url).send().await.map_err(|e| {
+                EngineError::Network(format!("Failed to check transfer status: {}", e))
+            })?;
 
             if !response.status().is_success() {
                 return Err(EngineError::Network(format!(
@@ -327,10 +326,9 @@ impl TransferClient {
                 )));
             }
 
-            let status: TransferApprovalStatus = response
-                .json()
-                .await
-                .map_err(|e| EngineError::Serialization(format!("Failed to parse status: {}", e)))?;
+            let status: TransferApprovalStatus = response.json().await.map_err(|e| {
+                EngineError::Serialization(format!("Failed to parse status: {}", e))
+            })?;
 
             match status.status {
                 TransferDecision::Pending => {
@@ -370,7 +368,12 @@ impl TransferClient {
         // Create progress-tracking stream
         let event_handler = self.event_handler.clone();
         let transfer_id_owned = params.transfer_id.to_string();
-        let file_name = params.file_path.file_name().unwrap().to_string_lossy().to_string();
+        let file_name = params
+            .file_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         let last_update = Arc::new(AtomicU64::new(0));
         let total_transfer_size = params.total_transfer_size;
 
@@ -439,13 +442,14 @@ impl TransferClient {
         } else {
             0
         };
-        self.event_handler.on_event(EngineEvent::TransferProgress(TransferProgress {
-            transfer_id: transfer_id_owned,
-            current_file: Some(file_name),
-            bytes_transferred: final_bytes,
-            total_bytes: total_transfer_size,
-            speed_bps,
-        }));
+        self.event_handler
+            .on_event(EngineEvent::TransferProgress(TransferProgress {
+                transfer_id: transfer_id_owned,
+                current_file: Some(file_name),
+                bytes_transferred: final_bytes,
+                total_bytes: total_transfer_size,
+                speed_bps,
+            }));
 
         Ok(())
     }
@@ -474,9 +478,7 @@ impl TransferClient {
                 .to_string_lossy()
                 .to_string();
 
-            let mime_type = mime_guess::from_path(path)
-                .first()
-                .map(|m| m.to_string());
+            let mime_type = mime_guess::from_path(path).first().map(|m| m.to_string());
 
             files.push(TransferFile {
                 id: Uuid::new_v4().to_string(),
@@ -522,7 +524,13 @@ impl TransferClient {
             Err(e) => {
                 // Record failed transfer to history
                 if let Some(ref history) = self.history {
-                    record_history(history, &files, TransferStatus::Failed, 0, Some(e.to_string()));
+                    record_history(
+                        history,
+                        &files,
+                        TransferStatus::Failed,
+                        0,
+                        Some(e.to_string()),
+                    );
                 }
                 self.event_handler.on_event(EngineEvent::TransferFailed {
                     transfer_id: transfer_id.clone(),
@@ -616,7 +624,13 @@ impl TransferClient {
                 // Record failed transfer
                 let bytes = bytes_sent_so_far.load(Ordering::SeqCst);
                 if let Some(ref history) = self.history {
-                    record_history(history, &files, TransferStatus::Failed, bytes, Some(e.to_string()));
+                    record_history(
+                        history,
+                        &files,
+                        TransferStatus::Failed,
+                        bytes,
+                        Some(e.to_string()),
+                    );
                 }
                 self.event_handler.on_event(EngineEvent::TransferFailed {
                     transfer_id: transfer_id.clone(),
@@ -630,13 +644,18 @@ impl TransferClient {
 
         // Record successful transfer
         if let Some(ref history) = self.history {
-            record_history(history, &files, TransferStatus::Completed, total_transfer_size, None);
+            record_history(
+                history,
+                &files,
+                TransferStatus::Completed,
+                total_transfer_size,
+                None,
+            );
         }
 
         // Emit completion event
-        self.event_handler.on_event(EngineEvent::TransferComplete {
-            transfer_id,
-        });
+        self.event_handler
+            .on_event(EngineEvent::TransferComplete { transfer_id });
 
         Ok(())
     }
@@ -687,9 +706,7 @@ impl TransferClient {
                 .to_string_lossy()
                 .to_string();
 
-            let mime_type = mime_guess::from_path(path)
-                .first()
-                .map(|m| m.to_string());
+            let mime_type = mime_guess::from_path(path).first().map(|m| m.to_string());
 
             files.push(TransferFile {
                 id: Uuid::new_v4().to_string(),
@@ -735,7 +752,13 @@ impl TransferClient {
             Ok(r) => r,
             Err(e) => {
                 if let Some(ref history) = self.history {
-                    record_history(history, &files, TransferStatus::Failed, 0, Some(e.to_string()));
+                    record_history(
+                        history,
+                        &files,
+                        TransferStatus::Failed,
+                        0,
+                        Some(e.to_string()),
+                    );
                 }
                 self.event_handler.on_event(EngineEvent::TransferFailed {
                     transfer_id: transfer_id.clone(),
@@ -751,7 +774,13 @@ impl TransferClient {
                 None => {
                     let err = EngineError::Network("No token received".to_string());
                     if let Some(ref history) = self.history {
-                        record_history(history, &files, TransferStatus::Failed, 0, Some(err.to_string()));
+                        record_history(
+                            history,
+                            &files,
+                            TransferStatus::Failed,
+                            0,
+                            Some(err.to_string()),
+                        );
                     }
                     self.event_handler.on_event(EngineEvent::TransferFailed {
                         transfer_id: transfer_id.clone(),
@@ -767,7 +796,13 @@ impl TransferClient {
                     None => {
                         let err = EngineError::Network("No token received".to_string());
                         if let Some(ref history) = self.history {
-                            record_history(history, &files, TransferStatus::Failed, 0, Some(err.to_string()));
+                            record_history(
+                                history,
+                                &files,
+                                TransferStatus::Failed,
+                                0,
+                                Some(err.to_string()),
+                            );
                         }
                         self.event_handler.on_event(EngineEvent::TransferFailed {
                             transfer_id: transfer_id.clone(),
@@ -815,7 +850,13 @@ impl TransferClient {
             {
                 let bytes = bytes_sent_so_far.load(Ordering::SeqCst);
                 if let Some(ref history) = self.history {
-                    record_history(history, &files, TransferStatus::Failed, bytes, Some(e.to_string()));
+                    record_history(
+                        history,
+                        &files,
+                        TransferStatus::Failed,
+                        bytes,
+                        Some(e.to_string()),
+                    );
                 }
                 self.event_handler.on_event(EngineEvent::TransferFailed {
                     transfer_id: transfer_id.clone(),
@@ -824,18 +865,27 @@ impl TransferClient {
                 return Err(e);
             }
 
-            tracing::info!("Sent file: {} ({})", file.name, file.relative_path.as_deref().unwrap_or(""));
+            tracing::info!(
+                "Sent file: {} ({})",
+                file.name,
+                file.relative_path.as_deref().unwrap_or("")
+            );
         }
 
         // Record successful transfer
         if let Some(ref history) = self.history {
-            record_history(history, &files, TransferStatus::Completed, total_transfer_size, None);
+            record_history(
+                history,
+                &files,
+                TransferStatus::Completed,
+                total_transfer_size,
+                None,
+            );
         }
 
         // Emit completion event
-        self.event_handler.on_event(EngineEvent::TransferComplete {
-            transfer_id,
-        });
+        self.event_handler
+            .on_event(EngineEvent::TransferComplete { transfer_id });
 
         Ok(())
     }
@@ -850,15 +900,18 @@ impl TransferClient {
             .map_err(|e| EngineError::FileIo(format!("Failed to read directory: {}", e)))?;
 
         for entry in entries {
-            let entry = entry
-                .map_err(|e| EngineError::FileIo(format!("Failed to read directory entry: {}", e)))?;
+            let entry = entry.map_err(|e| {
+                EngineError::FileIo(format!("Failed to read directory entry: {}", e))
+            })?;
             let path = entry.path();
 
             if path.is_file() {
                 // Calculate relative path from base
                 let relative = path
                     .strip_prefix(base_path)
-                    .map_err(|_| EngineError::FileIo("Failed to calculate relative path".to_string()))?
+                    .map_err(|_| {
+                        EngineError::FileIo("Failed to calculate relative path".to_string())
+                    })?
                     .to_string_lossy()
                     .to_string();
                 files.push((path, relative));

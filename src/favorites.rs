@@ -153,7 +153,9 @@ mod tests {
         let store = InMemoryFavorites::new();
 
         // Add a favorite
-        let fav = store.add("Test".to_string(), "192.168.1.1".to_string()).unwrap();
+        let fav = store
+            .add("Test".to_string(), "192.168.1.1".to_string())
+            .unwrap();
         assert_eq!(fav.name, "Test");
         assert_eq!(fav.address, "192.168.1.1");
 

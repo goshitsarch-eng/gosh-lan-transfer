@@ -8,17 +8,17 @@ This crate provides the core transfer engine without any GUI dependencies, makin
 
 Sharing files between devices on the same network shouldn't require uploading to the cloud, installing platform-specific software, or configuring SSH keys. Yet existing solutions each come with significant limitations.
 
-**AirDrop and Nearby Share** work seamlessly within their ecosystems, but they lock you into Apple or Google platforms respectively. If you have a mix of devices—a MacBook, a Windows desktop, a Linux server, and an Android phone—these solutions leave you stranded.
+**AirDrop and Nearby Share** work seamlessly within their ecosystems, but they lock you into Apple or Google platforms respectively. If you have a mix of devices a MacBook, a Windows desktop, a Linux server, and an Android phone these solutions leave you stranded.
 
-**Cloud services** like Dropbox, Google Drive, or WeTransfer solve the cross-platform problem, but they route your files through external servers. For a 10GB video file sitting on your laptop that you want on your desktop three feet away, uploading to the cloud and downloading again wastes time and bandwidth. It also means your files pass through third-party infrastructure, which may be unacceptable for sensitive data.
+**Cloud services** like Dropbox, Google Drive, or WeTransfer solve the cross platform problem, but they route your files through external servers. For a 10GB video file sitting on your laptop that you want on your desktop three feet away, uploading to the cloud and downloading again wastes time and bandwidth. It also means your files pass through third-party infrastructure, which may be unacceptable for sensitive data.
 
-**SCP and rsync** are powerful and cross-platform, but they require SSH access, key management, and command-line knowledge. They're tools for sysadmins, not for quickly sending a folder to a colleague.
+**SCP and rsync** are powerful and cross platform, but they require SSH access, key management, and command line knowledge. They're tools for sysadmins, not for quickly sending a folder to a colleague.
 
-**LocalSend** offers a good user experience for casual file sharing, but it's an end-user application, not a library. If you're building your own file-sharing feature into an application, you can't easily integrate it.
+**LocalSend** offers a good user experience for casual file sharing, but it's an end-user application, not a library. If you're building your own file sharing feature into an application, you can't easily integrate it.
 
-gosh-lan-transfer takes a different approach. It's a library first, designed to be embedded into whatever application you're building. The HTTP-based protocol works across any platform that supports TCP. There's no proprietary discovery mechanism that might break across network boundaries—you simply specify the target device's IP or hostname. It works equally well on traditional LANs, corporate VPNs, and Tailscale networks where mDNS discovery often fails.
+gosh-lan-transfer takes a different approach. It's a library first, designed to be embedded into whatever application you're building. The HTTP-based protocol works across any platform that supports TCP. There's no proprietary discovery mechanism that might break across network boundaries, you simply specify the target device's IP or hostname. It works equally well on traditional LANs, corporate VPNs, and Tailscale networks where mDNS discovery often fails.
 
-The library handles the complexity of file transfer—progress tracking, approval workflows, retry logic, directory transfers—while staying out of your way on everything else. You provide the UI, the storage backend, and the user experience. gosh-lan-transfer provides reliable, fast, direct transfers.
+The library handles the complexity of file transfer progress tracking, approval workflows, retry logic, directory transfers, while staying out of your way on everything else. You provide the UI, the storage backend, and the user experience. gosh-lan-transfer provides reliable, fast, direct transfers.
 
 ## Core Capabilities
 
@@ -26,7 +26,7 @@ The engine supports sending individual files or entire directory trees with thei
 
 The event-driven architecture means your application stays responsive. Whether you're building a GUI that needs to update a progress bar, a CLI that prints status to the terminal, or a headless service that logs to a file, the same event stream powers all of them. Three built-in event handlers cover common cases, and implementing your own takes just a few lines.
 
-For applications that need to remember transfer history or save frequently-used peers, the library defines persistence traits that you implement with whatever storage backend fits your needs—SQLite, JSON files, or a full database. In-memory implementations ship with the library for testing and simple use cases.
+For applications that need to remember transfer history or save frequently used peers, the library defines persistence traits that you implement with whatever storage backend fits your needs SQLite, JSON files, or a full database. In memory implementations ship with the library for testing and simple use cases.
 
 ## Installation
 
@@ -121,7 +121,7 @@ The library centers on `GoshTransferEngine`, which coordinates all operations. I
 └─────────────────────────────────────────────────────────────┘
 ```
 
-Types are organized with a clear separation between what crosses the engine boundary and what stays internal. The `protocol` module contains wire protocol types and event payloads—anything sent over HTTP or emitted as an event lives here. The `types` module holds domain entities like favorites and transfer records that don't leave the local process.
+Types are organized with a clear separation between what crosses the engine boundary and what stays internal. The `protocol` module contains wire protocol types and event payloads anything sent over HTTP or emitted as an event lives here. The `types` module holds domain entities like favorites and transfer records that don't leave the local process.
 
 ## Module Organization
 
@@ -147,7 +147,7 @@ The main entry point for all operations. You create an engine with a configurati
 
 #### Creating an Engine
 
-The library offers several ways to create an engine depending on how you want to handle events. Channel-based events work best for async applications where you want to process events in a separate task. Callback-based events suit simpler use cases or FFI scenarios. The no-op handler discards all events, useful for batch operations or testing.
+The library offers several ways to create an engine depending on how you want to handle events. Channel based events work best for async applications where you want to process events in a separate task. Callback based events suit simpler use cases or FFI scenarios. The no-op handler discards all events, useful for batch operations or testing.
 
 ```rust
 use gosh_lan_transfer::{GoshTransferEngine, EngineConfig, callback_handler, EngineEvent};
@@ -517,7 +517,7 @@ SENDER                                    RECEIVER
 
 ### Security
 
-Each approved transfer receives a unique UUID token that must accompany all file uploads, preventing unauthorized data injection. Received filenames are sanitized to prevent path traversal attacks—only the filename component is used, and parent directory references are stripped. Files exceeding their declared size are rejected and deleted.
+Each approved transfer receives a unique UUID token that must accompany all file uploads, preventing unauthorized data injection. Received filenames are sanitized to prevent path traversal attacks only the filename component is used, and parent directory references are stripped. Files exceeding their declared size are rejected and deleted.
 
 The library is designed for trusted networks and does not implement user authentication. If you need transfers over untrusted networks, layer TLS on top or use a VPN.
 
@@ -610,7 +610,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### Protocol Types
 
-These types cross the engine boundary—they're either sent over HTTP or emitted as events.
+These types cross the engine boundary they're either sent over HTTP or emitted as events.
 
 **TransferFile** represents a single file in a transfer, with an ID, name, size, optional MIME type, and optional relative path for directory transfers.
 
@@ -626,7 +626,7 @@ These types cross the engine boundary—they're either sent over HTTP or emitted
 
 These types stay within the local process.
 
-**Favorite** represents a saved peer with ID, display name, address, cached IP, and last-used timestamp.
+**Favorite** represents a saved peer with ID, display name, address, cached IP, and last used timestamp.
 
 **TransferRecord** captures completed or failed transfer history: direction, status, peer address, file list, sizes, timestamps, and error message if applicable.
 

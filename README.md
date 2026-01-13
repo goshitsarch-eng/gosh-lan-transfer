@@ -1,5 +1,9 @@
 # gosh-lan-transfer
 
+[![Crates.io](https://img.shields.io/crates/v/gosh-lan-transfer.svg)](https://crates.io/crates/gosh-lan-transfer)
+[![Documentation](https://docs.rs/gosh-lan-transfer/badge.svg)](https://docs.rs/gosh-lan-transfer)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A Rust library for peer-to-peer file transfers over LAN, VPN, or Tailscale networks.
 
 This crate provides the core transfer engine without any GUI dependencies, making it suitable for integration into CLI tools, desktop applications, mobile apps, or headless services. Files transfer directly between devices with no cloud intermediary, keeping your data private and your transfers fast.

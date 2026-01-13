@@ -60,6 +60,10 @@ pub struct TransferFile {
     pub mime_type: Option<String>,
     /// Unique identifier for this file in the transfer
     pub id: String,
+    /// Relative path within a directory transfer (e.g., "subdir/file.txt")
+    /// When present, the receiver will recreate the directory structure
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relative_path: Option<String>,
 }
 
 /// Metadata for a transfer request (sent before actual data)
@@ -172,6 +176,17 @@ pub enum EngineEvent {
     /// Transfer failed
     TransferFailed {
         transfer_id: String,
+        error: String,
+    },
+
+    /// Retrying a failed operation
+    TransferRetry {
+        transfer_id: String,
+        /// Current attempt number (1-based)
+        attempt: u32,
+        /// Maximum attempts allowed
+        max_attempts: u32,
+        /// Error that triggered the retry
         error: String,
     },
 

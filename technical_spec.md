@@ -14,6 +14,7 @@ gosh-lan-transfer is a Rust library providing peer-to-peer file transfer capabil
 │  - Coordinates all operations                                │
 │  - Manages server lifecycle                                  │
 │  - Provides high-level API                                   │
+│  - Automatic history recording                               │
 ├─────────────────────────────────────────────────────────────┤
 │                                                              │
 │  ┌─────────────────┐          ┌─────────────────┐           │
@@ -23,6 +24,7 @@ gosh-lan-transfer is a Rust library providing peer-to-peer file transfer capabil
 │  │  - DNS resolve  │          │  - HTTP server  │           │
 │  │  - File upload  │          │  - File receive │           │
 │  │  - Progress     │          │  - Approval     │           │
+│  │  - Retry logic  │          │  - Dir support  │           │
 │  └─────────────────┘          └─────────────────┘           │
 │                                                              │
 ├─────────────────────────────────────────────────────────────┤
@@ -31,6 +33,11 @@ gosh-lan-transfer is a Rust library providing peer-to-peer file transfer capabil
 │  - TransferRequest/Response    │  - ChannelEventHandler     │
 │  - TransferProgress            │  - CallbackEventHandler    │
 │  - PendingTransfer             │  - NoopEventHandler        │
+├─────────────────────────────────────────────────────────────┤
+│  history (persistence)         │  config (settings)         │
+│  - HistoryPersistence trait    │  - EngineConfig            │
+│  - InMemoryHistory             │  - EngineConfigBuilder     │
+│  - TransferRecord              │  - Retry/bandwidth options │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -99,6 +106,7 @@ struct TransferFile {
     name: String,             // Filename only (no path)
     size: u64,
     mime_type: Option<String>,
+    relative_path: Option<String>, // For directory transfers
 }
 
 // Response to transfer request
@@ -124,6 +132,7 @@ enum EngineEvent {
     TransferProgress(TransferProgress),
     TransferComplete { transfer_id: String },
     TransferFailed { transfer_id: String, error: String },
+    TransferRetry { transfer_id: String, attempt: u32, max_attempts: u32, error: String },
     ServerStarted { port: u16 },
     ServerStopped,
 }
@@ -164,6 +173,46 @@ struct TransferRecord {
 }
 ```
 
+### Configuration
+
+```rust
+struct EngineConfig {
+    port: u16,                           // Default: 53317
+    device_name: String,                 // Default: system hostname
+    download_dir: PathBuf,               // Default: current directory
+    trusted_hosts: Vec<String>,          // Default: empty
+    receive_only: bool,                  // Default: false
+    max_retries: u32,                    // Default: 3
+    retry_delay_ms: u64,                 // Default: 1000
+    bandwidth_limit_bps: Option<u64>,    // Default: None (unlimited)
+}
+```
+
+### Persistence Traits
+
+```rust
+// Transfer history persistence
+trait HistoryPersistence: Send + Sync {
+    fn list(&self) -> EngineResult<Vec<TransferRecord>>;
+    fn list_paginated(&self, offset: usize, limit: usize) -> EngineResult<Vec<TransferRecord>>;
+    fn get(&self, transfer_id: &str) -> EngineResult<Option<TransferRecord>>;
+    fn add(&self, record: TransferRecord) -> EngineResult<()>;
+    fn delete(&self, transfer_id: &str) -> EngineResult<()>;
+    fn clear(&self) -> EngineResult<()>;
+    fn count(&self) -> EngineResult<usize>;
+}
+
+// Favorites persistence (peers)
+trait FavoritesPersistence: Send + Sync {
+    fn list(&self) -> EngineResult<Vec<Favorite>>;
+    fn add(&self, favorite: Favorite) -> EngineResult<()>;
+    fn update(&self, favorite: Favorite) -> EngineResult<()>;
+    fn delete(&self, id: &str) -> EngineResult<()>;
+    fn get(&self, id: &str) -> EngineResult<Option<Favorite>>;
+    fn touch(&self, id: &str) -> EngineResult<()>;
+}
+```
+
 ## API Specification
 
 ### HTTP Endpoints
@@ -195,17 +244,23 @@ struct TransferRecord {
 
 5. **Speed calculation**: Transfer speed is calculated as total bytes transferred divided by elapsed time since transfer start.
 
+6. **Retry logic**: Transient failures (network errors, connection refused) are automatically retried with exponential backoff: `delay * 2^attempt`. Only the initial transfer request is retried, not individual chunk uploads.
+
+7. **Directory transfers**: Files are collected recursively and sent with relative paths. The receiver creates subdirectories as needed under the download directory.
+
 ## Security Considerations
 
 1. **Token-based authorization**: Upload tokens are UUID v4, providing 122 bits of randomness.
 
 2. **Filename sanitization**: Received filenames are sanitized to prevent path traversal attacks. Only the filename component is used.
 
-3. **Size validation**: Files exceeding their declared size are rejected and deleted.
+3. **Relative path sanitization**: Directory transfer paths are sanitized to prevent traversal attacks. Parent directory components (`..`) and absolute paths are stripped.
 
-4. **No authentication**: The library is designed for trusted networks (LAN, VPN, Tailscale). It does not implement user authentication.
+4. **Size validation**: Files exceeding their declared size are rejected and deleted.
 
-5. **Trust model**: Auto-acceptance only applies to explicitly configured trusted host IPs.
+5. **No authentication**: The library is designed for trusted networks (LAN, VPN, Tailscale). It does not implement user authentication.
+
+6. **Trust model**: Auto-acceptance only applies to explicitly configured trusted host IPs.
 
 ## Infrastructure Requirements
 

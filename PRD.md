@@ -30,61 +30,70 @@ gosh-lan-transfer is a Rust library that enables peer-to-peer file transfers ove
 
 ### Core Transfer Capabilities
 
-| ID | Requirement | Priority |
-|----|-------------|----------|
-| FR-1 | Send one or more files to a peer by IP address or hostname | Must Have |
-| FR-2 | Receive files from peers with approval workflow | Must Have |
-| FR-3 | Auto-accept transfers from configured trusted hosts | Must Have |
-| FR-4 | Track transfer progress with byte-level granularity | Must Have |
-| FR-5 | Cancel in-progress transfers | Should Have |
-| FR-6 | Resume interrupted transfers | Could Have (not implemented) |
+| ID | Requirement | Priority | Status |
+|----|-------------|----------|--------|
+| FR-1 | Send one or more files to a peer by IP address or hostname | Must Have | ✓ Implemented |
+| FR-2 | Receive files from peers with approval workflow | Must Have | ✓ Implemented |
+| FR-3 | Auto-accept transfers from configured trusted hosts | Must Have | ✓ Implemented |
+| FR-4 | Track transfer progress with byte-level granularity | Must Have | ✓ Implemented |
+| FR-5 | Cancel in-progress transfers | Should Have | ✓ Implemented |
+| FR-6 | Resume interrupted transfers | Could Have | Not implemented |
+| FR-6a | Send entire directories with structure preserved | Should Have | ✓ Implemented |
+| FR-6b | Batch accept/reject all pending transfers | Should Have | ✓ Implemented |
+| FR-6c | Automatic retry with exponential backoff | Should Have | ✓ Implemented |
 
 ### Server Operations
 
-| ID | Requirement | Priority |
-|----|-------------|----------|
-| FR-7 | Start HTTP server on configurable port | Must Have |
-| FR-8 | Stop server gracefully | Must Have |
-| FR-9 | Query server running status | Must Have |
-| FR-10 | Handle multiple concurrent transfer sessions | Must Have |
+| ID | Requirement | Priority | Status |
+|----|-------------|----------|--------|
+| FR-7 | Start HTTP server on configurable port | Must Have | ✓ Implemented |
+| FR-8 | Stop server gracefully | Must Have | ✓ Implemented |
+| FR-9 | Query server running status | Must Have | ✓ Implemented |
+| FR-10 | Handle multiple concurrent transfer sessions | Must Have | ✓ Implemented |
 
 ### Network Utilities
 
-| ID | Requirement | Priority |
-|----|-------------|----------|
-| FR-11 | Resolve hostnames to IP addresses | Must Have |
-| FR-12 | Enumerate local network interfaces | Must Have |
-| FR-13 | Check peer reachability (health check) | Must Have |
-| FR-14 | Retrieve peer device information | Should Have |
+| ID | Requirement | Priority | Status |
+|----|-------------|----------|--------|
+| FR-11 | Resolve hostnames to IP addresses | Must Have | ✓ Implemented |
+| FR-12 | Enumerate local network interfaces | Must Have | ✓ Implemented |
+| FR-13 | Check peer reachability (health check) | Must Have | ✓ Implemented |
+| FR-14 | Retrieve peer device information | Should Have | ✓ Implemented |
 
 ### Configuration
 
-| ID | Requirement | Priority |
-|----|-------------|----------|
-| FR-15 | Configure server port | Must Have |
-| FR-16 | Configure device display name | Must Have |
-| FR-17 | Configure download directory | Must Have |
-| FR-18 | Manage trusted hosts list | Must Have |
-| FR-19 | Enable receive-only mode | Should Have |
+| ID | Requirement | Priority | Status |
+|----|-------------|----------|--------|
+| FR-15 | Configure server port | Must Have | ✓ Implemented |
+| FR-16 | Configure device display name | Must Have | ✓ Implemented |
+| FR-17 | Configure download directory | Must Have | ✓ Implemented |
+| FR-18 | Manage trusted hosts list | Must Have | ✓ Implemented |
+| FR-19 | Enable receive-only mode | Should Have | ✓ Implemented |
+| FR-19a | Configure retry attempts and delay | Should Have | ✓ Implemented |
+| FR-19b | Configure bandwidth limit | Could Have | Config added, throttling not implemented |
 
 ### Event System
 
-| ID | Requirement | Priority |
-|----|-------------|----------|
-| FR-20 | Emit events for transfer requests | Must Have |
-| FR-21 | Emit events for transfer progress | Must Have |
-| FR-22 | Emit events for transfer completion/failure | Must Have |
-| FR-23 | Support channel-based event delivery | Must Have |
-| FR-24 | Support callback-based event delivery | Must Have |
-| FR-25 | Support SSE streaming for web clients | Should Have |
+| ID | Requirement | Priority | Status |
+|----|-------------|----------|--------|
+| FR-20 | Emit events for transfer requests | Must Have | ✓ Implemented |
+| FR-21 | Emit events for transfer progress | Must Have | ✓ Implemented |
+| FR-22 | Emit events for transfer completion/failure | Must Have | ✓ Implemented |
+| FR-23 | Support channel-based event delivery | Must Have | ✓ Implemented |
+| FR-24 | Support callback-based event delivery | Must Have | ✓ Implemented |
+| FR-25 | Support SSE streaming for web clients | Should Have | ✓ Implemented |
+| FR-25a | Emit events for retry attempts | Should Have | ✓ Implemented |
 
 ### Persistence (Trait-based)
 
-| ID | Requirement | Priority |
-|----|-------------|----------|
-| FR-26 | Define trait for favorites persistence | Must Have |
-| FR-27 | Provide in-memory favorites implementation | Must Have |
-| FR-28 | CRUD operations for saved peers | Must Have |
+| ID | Requirement | Priority | Status |
+|----|-------------|----------|--------|
+| FR-26 | Define trait for favorites persistence | Must Have | ✓ Implemented |
+| FR-27 | Provide in-memory favorites implementation | Must Have | ✓ Implemented |
+| FR-28 | CRUD operations for saved peers | Must Have | ✓ Implemented |
+| FR-29 | Define trait for transfer history persistence | Should Have | ✓ Implemented |
+| FR-30 | Provide in-memory history implementation | Should Have | ✓ Implemented |
+| FR-31 | Automatic history recording on transfer complete/fail | Should Have | ✓ Implemented |
 
 ## Non-Functional Requirements
 
@@ -152,8 +161,9 @@ gosh-lan-transfer is a Rust library that enables peer-to-peer file transfers ove
 
 ## Future Considerations
 
-1. **Peer Discovery** - mDNS/Bonjour for automatic peer detection
-2. **Transfer Resume** - Checkpoint and resume interrupted transfers
+1. **Peer Discovery** - mDNS/Bonjour for automatic peer detection (users can manually enter IP/hostname)
+2. **Transfer Resume** - Checkpoint and resume interrupted transfers (retry logic handles transient failures)
 3. **Compression** - Optional on-the-fly compression for slow networks
 4. **Encryption** - TLS support for transfers over untrusted networks
-5. **Bandwidth Limiting** - Rate limiting to avoid network saturation
+5. **Bandwidth Throttling** - Actual rate limiting implementation (config field added, throttling pending)
+6. **Concurrent Transfer Queue** - Queue and run multiple sends in parallel

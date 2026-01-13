@@ -16,6 +16,13 @@ pub struct EngineConfig {
     pub trusted_hosts: Vec<String>,
     /// Receive-only mode (disable sending)
     pub receive_only: bool,
+    /// Maximum number of retry attempts for transient failures (default: 3)
+    pub max_retries: u32,
+    /// Base delay between retries in milliseconds (default: 1000)
+    /// Actual delay uses exponential backoff: delay * 2^attempt
+    pub retry_delay_ms: u64,
+    /// Optional bandwidth limit in bytes per second (None = unlimited)
+    pub bandwidth_limit_bps: Option<u64>,
 }
 
 impl Default for EngineConfig {
@@ -28,6 +35,9 @@ impl Default for EngineConfig {
             download_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             trusted_hosts: Vec::new(),
             receive_only: false,
+            max_retries: 3,
+            retry_delay_ms: 1000,
+            bandwidth_limit_bps: None,
         }
     }
 }
@@ -52,6 +62,9 @@ pub struct EngineConfigBuilder {
     download_dir: Option<PathBuf>,
     trusted_hosts: Option<Vec<String>>,
     receive_only: Option<bool>,
+    max_retries: Option<u32>,
+    retry_delay_ms: Option<u64>,
+    bandwidth_limit_bps: Option<Option<u64>>,
 }
 
 impl EngineConfigBuilder {
@@ -93,6 +106,24 @@ impl EngineConfigBuilder {
         self
     }
 
+    /// Set maximum retry attempts for transient failures
+    pub fn max_retries(mut self, retries: u32) -> Self {
+        self.max_retries = Some(retries);
+        self
+    }
+
+    /// Set base delay between retries in milliseconds
+    pub fn retry_delay_ms(mut self, delay_ms: u64) -> Self {
+        self.retry_delay_ms = Some(delay_ms);
+        self
+    }
+
+    /// Set bandwidth limit in bytes per second (None = unlimited)
+    pub fn bandwidth_limit_bps(mut self, limit: Option<u64>) -> Self {
+        self.bandwidth_limit_bps = Some(limit);
+        self
+    }
+
     /// Build the configuration
     pub fn build(self) -> EngineConfig {
         let default = EngineConfig::default();
@@ -102,6 +133,9 @@ impl EngineConfigBuilder {
             download_dir: self.download_dir.unwrap_or(default.download_dir),
             trusted_hosts: self.trusted_hosts.unwrap_or(default.trusted_hosts),
             receive_only: self.receive_only.unwrap_or(default.receive_only),
+            max_retries: self.max_retries.unwrap_or(default.max_retries),
+            retry_delay_ms: self.retry_delay_ms.unwrap_or(default.retry_delay_ms),
+            bandwidth_limit_bps: self.bandwidth_limit_bps.unwrap_or(default.bandwidth_limit_bps),
         }
     }
 }

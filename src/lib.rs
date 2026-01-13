@@ -54,6 +54,7 @@ pub mod config;
 pub mod error;
 pub mod events;
 pub mod favorites;
+pub mod history;
 pub mod protocol;
 pub mod server;
 pub mod types;
@@ -76,6 +77,7 @@ pub use client::{get_network_interfaces, TransferClient};
 pub use config::{EngineConfig, EngineConfigBuilder};
 pub use error::{EngineError, EngineResult};
 pub use favorites::{FavoritesPersistence, InMemoryFavorites};
+pub use history::{HistoryPersistence, InMemoryHistory};
 pub use server::{ServerHandle, ServerState};
 
 // Domain types
@@ -96,13 +98,14 @@ pub struct GoshTransferEngine {
     server_state: Arc<ServerState>,
     server_handle: Option<ServerHandle>,
     event_handler: Arc<dyn EventHandler>,
+    history: Option<Arc<dyn HistoryPersistence>>,
 }
 
 impl GoshTransferEngine {
     /// Create a new engine with the given configuration and event handler
     pub fn new(config: EngineConfig, event_handler: Arc<dyn EventHandler>) -> Self {
         let server_state = Arc::new(ServerState::new(config.clone(), event_handler.clone()));
-        let client = TransferClient::new(event_handler.clone());
+        let client = TransferClient::new_with_config(event_handler.clone(), &config);
 
         Self {
             config,
@@ -110,6 +113,29 @@ impl GoshTransferEngine {
             server_state,
             server_handle: None,
             event_handler,
+            history: None,
+        }
+    }
+
+    /// Create a new engine with the given configuration, event handler, and history persistence
+    ///
+    /// The history will automatically record completed and failed transfers.
+    pub fn with_history(
+        config: EngineConfig,
+        event_handler: Arc<dyn EventHandler>,
+        history: Arc<dyn HistoryPersistence>,
+    ) -> Self {
+        let server_state =
+            Arc::new(ServerState::new_with_history(config.clone(), event_handler.clone(), history.clone()));
+        let client = TransferClient::new_with_history_and_config(event_handler.clone(), history.clone(), &config);
+
+        Self {
+            config,
+            client,
+            server_state,
+            server_handle: None,
+            event_handler,
+            history: Some(history),
         }
     }
 
@@ -122,6 +148,23 @@ impl GoshTransferEngine {
     ) -> (Self, tokio::sync::broadcast::Receiver<EngineEvent>) {
         let (handler, receiver) = channel_handler(100);
         (Self::new(config, handler), receiver)
+    }
+
+    /// Create a new engine with a channel-based event handler and history persistence
+    ///
+    /// This is a convenience constructor that returns both the engine
+    /// and a receiver for events.
+    pub fn with_channel_events_and_history(
+        config: EngineConfig,
+        history: Arc<dyn HistoryPersistence>,
+    ) -> (Self, tokio::sync::broadcast::Receiver<EngineEvent>) {
+        let (handler, receiver) = channel_handler(100);
+        (Self::with_history(config, handler, history), receiver)
+    }
+
+    /// Get the history persistence (if configured)
+    pub fn history(&self) -> Option<&Arc<dyn HistoryPersistence>> {
+        self.history.as_ref()
     }
 
     // === Server Operations ===
@@ -191,6 +234,32 @@ impl GoshTransferEngine {
             .await
     }
 
+    /// Send a directory and all its contents to a peer
+    ///
+    /// The directory structure will be preserved on the receiving end.
+    /// Files are sent with relative paths from the base directory.
+    pub async fn send_directory(
+        &self,
+        address: &str,
+        port: u16,
+        dir_path: impl AsRef<std::path::Path>,
+    ) -> EngineResult<()> {
+        if self.config.receive_only {
+            return Err(EngineError::InvalidConfig(
+                "Sending is disabled in receive-only mode".to_string(),
+            ));
+        }
+
+        self.client
+            .send_directory(
+                address,
+                port,
+                dir_path,
+                Some(self.config.device_name.clone()),
+            )
+            .await
+    }
+
     /// Accept a pending transfer
     ///
     /// Returns the token that the sender will use to upload files.
@@ -225,6 +294,53 @@ impl GoshTransferEngine {
         self.server_state.cancel_transfer(transfer_id).await
     }
 
+    /// Accept all pending transfers
+    ///
+    /// Returns a list of (transfer_id, result) pairs.
+    /// Each result contains either the token or the error.
+    pub async fn accept_all_transfers(&self) -> Vec<(String, EngineResult<String>)> {
+        if !self.is_server_running() {
+            let pending = self.get_pending_transfers().await;
+            return pending
+                .into_iter()
+                .map(|t| (t.id, Err(EngineError::ServerNotRunning)))
+                .collect();
+        }
+
+        let pending = self.get_pending_transfers().await;
+        let mut results = Vec::with_capacity(pending.len());
+
+        for transfer in pending {
+            let result = self.server_state.accept_transfer(&transfer.id).await;
+            results.push((transfer.id, result));
+        }
+
+        results
+    }
+
+    /// Reject all pending transfers
+    ///
+    /// Returns a list of (transfer_id, result) pairs.
+    pub async fn reject_all_transfers(&self) -> Vec<(String, EngineResult<()>)> {
+        if !self.is_server_running() {
+            let pending = self.get_pending_transfers().await;
+            return pending
+                .into_iter()
+                .map(|t| (t.id, Err(EngineError::ServerNotRunning)))
+                .collect();
+        }
+
+        let pending = self.get_pending_transfers().await;
+        let mut results = Vec::with_capacity(pending.len());
+
+        for transfer in pending {
+            let result = self.server_state.reject_transfer(&transfer.id).await;
+            results.push((transfer.id, result));
+        }
+
+        results
+    }
+
     // === Network Utilities ===
 
     /// Resolve a hostname or IP to all available addresses
@@ -256,8 +372,9 @@ impl GoshTransferEngine {
 
     /// Update the engine configuration
     ///
-    /// This updates both the engine config and the server state config.
+    /// This updates the engine config, client config, and server state config.
     pub async fn update_config(&mut self, config: EngineConfig) {
+        self.client.update_config(&config);
         self.config = config.clone();
         self.server_state.update_config(config).await;
     }

@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Transfer History System**
+  - `HistoryPersistence` trait for pluggable history storage
+  - `InMemoryHistory` implementation with optional record limit
+  - Automatic recording of completed and failed transfers
+  - Methods: `list()`, `get()`, `add()`, `delete()`, `clear()`, `count()`, `list_paginated()`
+  - Engine constructors: `with_history()`, `with_channel_events_and_history()`
+
+- **Retry Logic with Exponential Backoff**
+  - `max_retries` config option (default: 3)
+  - `retry_delay_ms` config option (default: 1000ms)
+  - Automatic retry for transient network errors
+  - `TransferRetry` event emitted on each retry attempt
+
+- **Batch Operations**
+  - `accept_all_transfers()` - Accept all pending transfers at once
+  - `reject_all_transfers()` - Reject all pending transfers at once
+  - Returns per-transfer results for error handling
+
+- **Directory Transfer Support**
+  - `send_directory()` method for recursive directory transfers
+  - `relative_path` field on `TransferFile` for preserving directory structure
+  - Server automatically creates subdirectories when receiving
+  - Path sanitization to prevent directory traversal attacks
+
+- **Bandwidth Limiting Configuration**
+  - `bandwidth_limit_bps` config option for rate limiting (implementation ready)
+
 - Transfer cancellation via `cancel_transfer()` method
 - Speed calculation (`speed_bps`) in `TransferProgress` events
 - IPv6 dual-stack support with automatic fallback to IPv4
@@ -20,6 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `accept_transfer()` and `reject_transfer()` now return `ServerNotRunning` error if server is not running
 - Server now binds to `[::]` (IPv6) first, falling back to `0.0.0.0` (IPv4) if unavailable
 - Progress events now include actual transfer speed
+- `TransferClient` now accepts configuration for retry settings
+- Engine `update_config()` now updates client retry settings
 
 ### Removed
 

@@ -12,6 +12,10 @@ This crate provides the core transfer engine without any GUI dependencies, makin
 - **Event-driven** - Flexible event system via traits or channels
 - **Trust-based approval** - Auto-accept transfers from trusted hosts
 - **Progress tracking** - Real-time progress updates during transfers
+- **Directory transfers** - Send entire directories with structure preserved
+- **Transfer history** - Automatic recording of completed/failed transfers
+- **Retry logic** - Automatic retry with exponential backoff for transient failures
+- **Batch operations** - Accept or reject all pending transfers at once
 - **Favorites management** - Save and manage frequently used peers
 - **Zero GUI dependencies** - Use from CLI, GUI, or headless applications
 
@@ -120,7 +124,8 @@ src/
 ├── error.rs        # EngineError
 ├── client.rs       # TransferClient (internal)
 ├── server.rs       # HTTP server (internal)
-└── favorites.rs    # FavoritesPersistence trait
+├── favorites.rs    # FavoritesPersistence trait
+└── history.rs      # HistoryPersistence trait
 ```
 
 ### Protocol Module
@@ -207,6 +212,17 @@ The send operation:
 2. Waits for approval (up to 2 minutes)
 3. Streams each file with progress updates
 4. Emits `TransferComplete` or `TransferFailed` event
+5. Automatically retries on transient network errors
+
+#### Sending Directories
+
+```rust
+// Send an entire directory with structure preserved
+engine.send_directory("192.168.1.100", 53317, "/path/to/folder").await?;
+```
+
+The directory is recursively enumerated and all files are sent with their relative paths.
+The receiver automatically creates the directory structure.
 
 #### Receiving Files
 
@@ -239,6 +255,27 @@ let pending = engine.get_pending_transfers().await;
 for transfer in pending {
     println!("{}: {} files from {}",
         transfer.id, transfer.files.len(), transfer.source_ip);
+}
+```
+
+#### Batch Operations
+
+```rust
+// Accept all pending transfers at once
+let results = engine.accept_all_transfers().await;
+for (transfer_id, result) in results {
+    match result {
+        Ok(token) => println!("Accepted {}", transfer_id),
+        Err(e) => eprintln!("Failed to accept {}: {}", transfer_id, e),
+    }
+}
+
+// Reject all pending transfers at once
+let results = engine.reject_all_transfers().await;
+for (transfer_id, result) in results {
+    if let Err(e) = result {
+        eprintln!("Failed to reject {}: {}", transfer_id, e);
+    }
 }
 ```
 
@@ -319,6 +356,9 @@ let config = EngineConfig::builder()
     .download_dir("/home/user/Downloads")     // Where to save files
     .trusted_hosts(vec!["192.168.1.10".into()]) // Auto-accept from these
     .receive_only(false)                      // Allow sending
+    .max_retries(3)                           // Retry failed transfers
+    .retry_delay_ms(1000)                     // Delay between retries
+    .bandwidth_limit_bps(Some(10_000_000))    // Limit to 10 MB/s (optional)
     .build();
 
 // Using defaults
@@ -328,6 +368,9 @@ let config = EngineConfig::default();
 // download_dir: current directory
 // trusted_hosts: empty
 // receive_only: false
+// max_retries: 3
+// retry_delay_ms: 1000
+// bandwidth_limit_bps: None (unlimited)
 ```
 
 ### Events
@@ -365,6 +408,12 @@ match event {
     // Transfer failed
     EngineEvent::TransferFailed { transfer_id, error } => {
         eprintln!("Transfer {} failed: {}", transfer_id, error);
+    }
+
+    // Transfer retry attempt (emitted before each retry)
+    EngineEvent::TransferRetry { transfer_id, attempt, max_attempts, error } => {
+        eprintln!("Retrying {} (attempt {}/{}): {}",
+            transfer_id, attempt, max_attempts, error);
     }
 
     // Server started
@@ -506,6 +555,89 @@ impl FavoritesPersistence for FileFavorites {
 
     fn get(&self, id: &str) -> EngineResult<Option<Favorite>> {
         // Find by ID
+    }
+}
+```
+
+### History Persistence
+
+The engine automatically records completed and failed transfers when a `HistoryPersistence` implementation is provided.
+
+```rust
+use gosh_lan_transfer::{
+    GoshTransferEngine, EngineConfig, HistoryPersistence, InMemoryHistory
+};
+use std::sync::Arc;
+
+// Create history storage (in-memory with optional limit)
+let history = Arc::new(InMemoryHistory::new());
+// Or with a limit: InMemoryHistory::with_limit(1000)
+
+// Create engine with history recording
+let config = EngineConfig::default();
+let (mut engine, events) = GoshTransferEngine::with_channel_events_and_history(
+    config,
+    history.clone(),
+);
+
+// Later: query transfer history
+let records = history.list()?;
+for record in records {
+    println!("{}: {} -> {} ({:?})",
+        record.id, record.peer_address,
+        record.files.len(), record.status);
+}
+
+// Paginated listing
+let page = history.list_paginated(0, 10)?; // First 10 records
+
+// Get specific record
+if let Some(record) = history.get("transfer-id")? {
+    println!("Transfer details: {:?}", record);
+}
+
+// Clear history
+history.clear()?;
+```
+
+#### Custom History Persistence
+
+Implement the trait for database or file-based storage:
+
+```rust
+use gosh_lan_transfer::{HistoryPersistence, TransferRecord, EngineResult};
+
+struct DatabaseHistory {
+    // your database connection
+}
+
+impl HistoryPersistence for DatabaseHistory {
+    fn list(&self) -> EngineResult<Vec<TransferRecord>> {
+        // Load all records
+    }
+
+    fn list_paginated(&self, offset: usize, limit: usize) -> EngineResult<Vec<TransferRecord>> {
+        // Load paginated records
+    }
+
+    fn get(&self, transfer_id: &str) -> EngineResult<Option<TransferRecord>> {
+        // Find by ID
+    }
+
+    fn add(&self, record: TransferRecord) -> EngineResult<()> {
+        // Insert record
+    }
+
+    fn delete(&self, transfer_id: &str) -> EngineResult<()> {
+        // Delete record
+    }
+
+    fn clear(&self) -> EngineResult<()> {
+        // Clear all records
+    }
+
+    fn count(&self) -> EngineResult<usize> {
+        // Return count
     }
 }
 ```
@@ -752,10 +884,11 @@ These types cross the engine boundary (wire protocol or events).
 
 ```rust
 pub struct TransferFile {
-    pub id: String,                // UUID for this file
-    pub name: String,              // Filename (no path)
-    pub size: u64,                 // Size in bytes
-    pub mime_type: Option<String>, // MIME type if detected
+    pub id: String,                    // UUID for this file
+    pub name: String,                  // Filename (no path)
+    pub size: u64,                     // Size in bytes
+    pub mime_type: Option<String>,     // MIME type if detected
+    pub relative_path: Option<String>, // Path within directory (for directory transfers)
 }
 ```
 

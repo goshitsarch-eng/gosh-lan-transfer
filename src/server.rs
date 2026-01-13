@@ -32,10 +32,12 @@ use uuid::Uuid;
 use crate::config::EngineConfig;
 use crate::error::{EngineError, EngineResult};
 use crate::events::EventHandler;
+use crate::history::HistoryPersistence;
 use crate::protocol::{
     EngineEvent, PendingTransfer, TransferApprovalStatus, TransferDecision, TransferProgress,
     TransferRequest, TransferResponse,
 };
+use crate::types::{TransferDirection, TransferRecord, TransferStatus};
 
 /// Server state shared across handlers
 pub struct ServerState {
@@ -59,6 +61,8 @@ pub struct ServerState {
     internal_event_tx: broadcast::Sender<InternalEvent>,
     /// Event handler for engine events
     event_handler: Arc<dyn EventHandler>,
+    /// Optional history persistence
+    history: Option<Arc<dyn HistoryPersistence>>,
 }
 
 /// Internal events for SSE streaming (serializable)
@@ -94,6 +98,30 @@ impl ServerState {
             transfer_start_times: RwLock::new(HashMap::new()),
             internal_event_tx,
             event_handler,
+            history: None,
+        }
+    }
+
+    /// Create a new server state with history persistence
+    pub fn new_with_history(
+        config: EngineConfig,
+        event_handler: Arc<dyn EventHandler>,
+        history: Arc<dyn HistoryPersistence>,
+    ) -> Self {
+        let (internal_event_tx, _) = broadcast::channel(100);
+
+        Self {
+            config: RwLock::new(config),
+            pending_transfers: RwLock::new(HashMap::new()),
+            approved_tokens: RwLock::new(HashMap::new()),
+            rejected_transfers: RwLock::new(HashMap::new()),
+            cancelled_transfers: RwLock::new(HashSet::new()),
+            received_files: RwLock::new(HashMap::new()),
+            transfer_bytes: RwLock::new(HashMap::new()),
+            transfer_start_times: RwLock::new(HashMap::new()),
+            internal_event_tx,
+            event_handler,
+            history: Some(history),
         }
     }
 
@@ -115,6 +143,33 @@ impl ServerState {
             _ => return, // Don't send server start/stop events to SSE
         };
         let _ = self.internal_event_tx.send(internal);
+    }
+
+    /// Record a completed or failed receive transfer to history
+    fn record_receive_history(
+        &self,
+        transfer: &PendingTransfer,
+        status: TransferStatus,
+        bytes_transferred: u64,
+        error: Option<String>,
+    ) {
+        if let Some(ref history) = self.history {
+            let record = TransferRecord {
+                id: transfer.id.clone(),
+                direction: TransferDirection::Received,
+                status,
+                peer_address: transfer.source_ip.clone(),
+                files: transfer.files.clone(),
+                total_size: transfer.total_size,
+                bytes_transferred,
+                started_at: transfer.received_at,
+                completed_at: Some(chrono::Utc::now()),
+                error,
+            };
+            if let Err(e) = history.add(record) {
+                tracing::warn!("Failed to record transfer history: {}", e);
+            }
+        }
     }
 
     /// Accept a pending transfer
@@ -163,14 +218,18 @@ impl ServerState {
     ///
     /// This will cause subsequent chunk uploads to be rejected.
     pub async fn cancel_transfer(&self, transfer_id: &str) -> EngineResult<()> {
-        // Check if transfer exists (either pending or approved)
+        // Check if transfer exists (either pending or approved) and get transfer info for history
         let pending = self.pending_transfers.read().await;
         let approved = self.approved_tokens.read().await;
         if !pending.contains_key(transfer_id) && !approved.contains_key(transfer_id) {
             return Err(EngineError::TransferNotFound(transfer_id.to_string()));
         }
+        let transfer_info = pending.get(transfer_id).cloned();
         drop(pending);
         drop(approved);
+
+        // Get bytes transferred so far
+        let bytes_transferred = *self.transfer_bytes.read().await.get(transfer_id).unwrap_or(&0);
 
         // Mark as cancelled
         self.cancelled_transfers
@@ -190,6 +249,16 @@ impl ServerState {
             transfer_id: transfer_id.to_string(),
             error: "Transfer cancelled".to_string(),
         });
+
+        // Record to history if we have transfer info
+        if let Some(transfer) = transfer_info {
+            self.record_receive_history(
+                &transfer,
+                TransferStatus::Failed,
+                bytes_transferred,
+                Some("Transfer cancelled".to_string()),
+            );
+        }
 
         Ok(())
     }
@@ -278,6 +347,24 @@ fn split_file_name(name: &str) -> (&str, &str) {
         }
     }
     (name, "")
+}
+
+/// Sanitize a relative path to prevent directory traversal attacks
+fn sanitize_relative_path(path: &str) -> PathBuf {
+    let mut result = PathBuf::new();
+
+    for component in Path::new(path).components() {
+        // Only allow normal path components (no . or ..)
+        // Skip root, parent (..), current (.), and prefix components
+        if let std::path::Component::Normal(name) = component {
+            if let Some(name_str) = name.to_str() {
+                let safe_name = sanitize_file_name(name_str, "file");
+                result.push(safe_name);
+            }
+        }
+    }
+
+    result
 }
 
 async fn open_unique_file(
@@ -517,21 +604,59 @@ async fn chunk_upload_handler(
         }
     };
 
-    let safe_name = sanitize_file_name(&file_info.name, &file_info.id);
-    let (file_path, mut file) = match open_unique_file(&download_dir, &safe_name).await {
-        Ok(result) => result,
-        Err(e) => {
-            tracing::error!("Failed to create file: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to create file: {}", e)})),
-            );
+    // Determine the target path based on relative_path
+    let (file_path, mut file) = if let Some(ref relative_path) = file_info.relative_path {
+        // Sanitize the relative path to prevent directory traversal
+        let sanitized_relative = sanitize_relative_path(relative_path);
+        let target_path = download_dir.join(&sanitized_relative);
+
+        // Create parent directories if needed
+        if let Some(parent) = target_path.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                tracing::error!("Failed to create directory structure: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to create directories: {}", e)})),
+                );
+            }
+        }
+
+        // Open or create with unique name within the subdirectory
+        let base_name = target_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&file_info.id);
+        let parent_dir = target_path.parent().unwrap_or(&download_dir);
+
+        match open_unique_file(parent_dir, base_name).await {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::error!("Failed to create file: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to create file: {}", e)})),
+                );
+            }
+        }
+    } else {
+        // No relative path, save directly in download_dir
+        let safe_name = sanitize_file_name(&file_info.name, &file_info.id);
+        match open_unique_file(&download_dir, &safe_name).await {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::error!("Failed to create file: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to create file: {}", e)})),
+                );
+            }
         }
     };
+
     let stored_name = file_path
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or(&safe_name)
+        .unwrap_or(&file_info.id)
         .to_string();
 
     // Initialize or get transfer start time and cumulative bytes
@@ -676,10 +801,17 @@ async fn chunk_upload_handler(
                 expected_count
             );
 
+            // Record to history before cleanup (clone transfer info)
+            let transfer_clone = transfer.clone();
+            let total_bytes = *state.transfer_bytes.read().await.get(&transfer_id).unwrap_or(&transfer.total_size);
+
             // Emit completion event
             state.emit_event(EngineEvent::TransferComplete {
                 transfer_id: transfer_id.clone(),
             });
+
+            // Record to history
+            state.record_receive_history(&transfer_clone, TransferStatus::Completed, total_bytes, None);
 
             // Clean up transfer state (drop the read lock first)
             drop(pending);

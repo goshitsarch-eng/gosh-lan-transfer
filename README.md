@@ -634,6 +634,12 @@ These types stay within the local process.
 
 **ResolveResult** holds DNS resolution results: the original hostname, resolved IPs, success flag, and error message if resolution failed.
 
+## Disclaimer
+
+This project is independent and is not sponsored by, endorsed by, or affiliated with LocalSend or GitHub, Inc.
+
+It is provided "as is", without warranty of any kind, express or implied, including but not limited to the warranties of merchantability or fitness for a particular purpose. Use at your own risk.
+
 ## License
 
 MIT - See [LICENSE](LICENSE) for details.

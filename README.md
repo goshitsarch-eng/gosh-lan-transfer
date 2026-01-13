@@ -34,7 +34,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-gosh-lan-transfer = { git = "https://github.com/your-org/gosh-lan-transfer" }
+gosh-lan-transfer = "0.2"
 tokio = { version = "1", features = ["full"] }
 ```
 

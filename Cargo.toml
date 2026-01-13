@@ -1,8 +1,8 @@
 [package]
 name = "gosh-lan-transfer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Core file transfer engine for LAN-based peer-to-peer file sharing"
-authors = ["Gosh Contributors"]
+authors = ["Goshitsarch"]
 license = "MIT"
 repository = "https://github.com/your-org/gosh-lan-transfer"
 edition = "2021"

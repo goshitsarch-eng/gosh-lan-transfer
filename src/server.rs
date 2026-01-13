@@ -735,14 +735,25 @@ pub async fn start_server(
 ) -> EngineResult<ServerHandle> {
     let app = create_router(state.clone());
 
-    // Bind to all interfaces (IPv4)
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-
     tracing::info!("Starting server on port {}", port);
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| EngineError::Network(format!("Failed to bind to port {}: {}", port, e)))?;
+    // Try binding to IPv6 wildcard first (dual-stack on most systems)
+    // Fall back to IPv4 only if IPv6 binding fails
+    let addr_v6 = SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
+    let addr_v4 = SocketAddr::from(([0, 0, 0, 0], port));
+
+    let listener = match tokio::net::TcpListener::bind(addr_v6).await {
+        Ok(l) => {
+            tracing::info!("Bound to IPv6 wildcard [::]:{}  (dual-stack)", port);
+            l
+        }
+        Err(e) => {
+            tracing::debug!("IPv6 bind failed ({}), falling back to IPv4", e);
+            tokio::net::TcpListener::bind(addr_v4)
+                .await
+                .map_err(|e| EngineError::Network(format!("Failed to bind to port {}: {}", port, e)))?
+        }
+    };
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 

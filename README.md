@@ -191,6 +191,15 @@ if engine.is_server_running() {
 
 // Stop the server
 engine.stop_server().await?;
+
+// Get current port
+let current_port = engine.port();
+
+// Change port at runtime (gracefully restarts server)
+engine.change_port(8080).await?;
+
+// Change port without rollback on failure
+engine.change_port_with_options(8080, false).await?;
 ```
 
 #### Sending Files
@@ -424,6 +433,11 @@ match event {
     // Server stopped
     EngineEvent::ServerStopped => {
         println!("Server stopped");
+    }
+
+    // Server port changed
+    EngineEvent::PortChanged { old_port, new_port } => {
+        println!("Port changed from {} to {}", old_port, new_port);
     }
 }
 ```

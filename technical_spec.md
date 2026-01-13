@@ -135,6 +135,7 @@ enum EngineEvent {
     TransferRetry { transfer_id: String, attempt: u32, max_attempts: u32, error: String },
     ServerStarted { port: u16 },
     ServerStopped,
+    PortChanged { old_port: u16, new_port: u16 },
 }
 
 struct TransferProgress {
@@ -205,8 +206,8 @@ trait HistoryPersistence: Send + Sync {
 // Favorites persistence (peers)
 trait FavoritesPersistence: Send + Sync {
     fn list(&self) -> EngineResult<Vec<Favorite>>;
-    fn add(&self, favorite: Favorite) -> EngineResult<()>;
-    fn update(&self, favorite: Favorite) -> EngineResult<()>;
+    fn add(&self, name: String, address: String) -> EngineResult<Favorite>;
+    fn update(&self, id: &str, name: Option<String>, address: Option<String>) -> EngineResult<Favorite>;
     fn delete(&self, id: &str) -> EngineResult<()>;
     fn get(&self, id: &str) -> EngineResult<Option<Favorite>>;
     fn touch(&self, id: &str) -> EngineResult<()>;

@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Runtime Port Change**
+  - `change_port(new_port)` method to change server port while running
+  - `change_port_with_options(new_port, rollback_on_failure)` for configurable rollback
+  - `port()` getter for current server port
+  - `PortChanged { old_port, new_port }` event emitted on port changes
+  - Port validation: rejects port 0, warns on privileged ports (< 1024)
+  - Automatic rollback to previous port if new port binding fails
+
 - **Transfer History System**
   - `HistoryPersistence` trait for pluggable history storage
   - `InMemoryHistory` implementation with optional record limit

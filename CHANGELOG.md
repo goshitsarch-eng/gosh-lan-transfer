@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-01-17
+
+### Fixed
+
+- Replace blocking filesystem operations with async in `send_directory()` to avoid blocking the Tokio runtime thread
+
 ## [0.2.0] - 2025-01-12
 
 ### Added

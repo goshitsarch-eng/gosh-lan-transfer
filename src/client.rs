@@ -673,7 +673,11 @@ impl TransferClient {
     ) -> EngineResult<()> {
         let dir_path = dir_path.as_ref();
 
-        if !dir_path.is_dir() {
+        let metadata = tokio::fs::metadata(dir_path)
+            .await
+            .map_err(|e| EngineError::FileIo(format!("Failed to access path: {}", e)))?;
+
+        if !metadata.is_dir() {
             return Err(EngineError::FileIo(format!(
                 "Path is not a directory: {}",
                 dir_path.display()
@@ -682,7 +686,7 @@ impl TransferClient {
 
         // Collect all files recursively
         let mut files_to_send: Vec<(PathBuf, String)> = Vec::new();
-        Self::collect_directory_files(dir_path, dir_path, &mut files_to_send)?;
+        Self::collect_directory_files_async(dir_path, dir_path, &mut files_to_send).await?;
 
         if files_to_send.is_empty() {
             return Err(EngineError::FileIo("Directory is empty".to_string()));
@@ -890,34 +894,33 @@ impl TransferClient {
         Ok(())
     }
 
-    /// Recursively collect all files in a directory with their relative paths
-    fn collect_directory_files(
+    /// Recursively collect all files in a directory with their relative paths (async version)
+    async fn collect_directory_files_async(
         base_path: &Path,
         current_path: &Path,
         files: &mut Vec<(PathBuf, String)>,
     ) -> EngineResult<()> {
-        let entries = std::fs::read_dir(current_path)
+        let mut entries = tokio::fs::read_dir(current_path)
+            .await
             .map_err(|e| EngineError::FileIo(format!("Failed to read directory: {}", e)))?;
 
-        for entry in entries {
-            let entry = entry.map_err(|e| {
-                EngineError::FileIo(format!("Failed to read directory entry: {}", e))
-            })?;
+        while let Some(entry) = entries.next_entry().await.map_err(|e| {
+            EngineError::FileIo(format!("Failed to read directory entry: {}", e))
+        })? {
             let path = entry.path();
+            let file_type = entry.file_type().await.map_err(|e| {
+                EngineError::FileIo(format!("Failed to get file type: {}", e))
+            })?;
 
-            if path.is_file() {
-                // Calculate relative path from base
+            if file_type.is_file() {
                 let relative = path
                     .strip_prefix(base_path)
-                    .map_err(|_| {
-                        EngineError::FileIo("Failed to calculate relative path".to_string())
-                    })?
+                    .map_err(|_| EngineError::FileIo("Failed to calculate relative path".to_string()))?
                     .to_string_lossy()
                     .to_string();
                 files.push((path, relative));
-            } else if path.is_dir() {
-                // Recurse into subdirectory
-                Self::collect_directory_files(base_path, &path, files)?;
+            } else if file_type.is_dir() {
+                Box::pin(Self::collect_directory_files_async(base_path, &path, files)).await?;
             }
         }
 

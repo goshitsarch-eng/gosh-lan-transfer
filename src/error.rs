@@ -41,6 +41,12 @@ pub enum EngineError {
 
     #[error("Transfer cancelled")]
     TransferCancelled,
+
+    #[error("Discovery already running")]
+    DiscoveryAlreadyRunning,
+
+    #[error("Discovery not running")]
+    DiscoveryNotRunning,
 }
 
 /// Result alias for engine operations

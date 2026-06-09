@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-09
+
+### Added
+
+- **UDP Multicast Peer Discovery**
+  - Engines find each other automatically on the local network
+    (multicast group `224.0.0.167`, UDP port `53318` by default)
+  - `start_discovery()` / `stop_discovery()` / `is_discovery_running()` for
+    continuous discovery, `discovered_peers()` for snapshots, and one-shot
+    `discover_peers(timeout)`
+  - `PeerDiscovered(DiscoveredPeer)` and `PeerLost { fingerprint, device_name }` events
+  - Config options: `discovery_multicast_addr`, `discovery_port`,
+    `discovery_announce_interval_secs`, `discovery_peer_timeout_secs`
+  - Announcements are unauthenticated and advisory only: peer-supplied device
+    names are sanitized, and discovery never bypasses transfer approval
+  - `DiscoveryAlreadyRunning` / `DiscoveryNotRunning` error variants
+- Integration tests covering transfer-wide progress reporting and loopback discovery
+
+### Fixed
+
+- **`bandwidth_limit_bps` now actually works.** The config option existed since
+  0.2.0 but was silently ignored; outgoing transfers are now paced to the
+  configured rate (send side only — receiving is never throttled)
+- **Flush failures no longer report success.** If the receiver fails to flush a
+  received file to disk, it deletes the partial file and returns HTTP 500
+  instead of logging the error and returning 200 OK
+- **Partial files are cleaned up on receive errors.** Write failures, stream
+  read errors, and size mismatches now remove the partial file and roll the
+  failed file's bytes back out of the cumulative progress counter
+- **Trusted hosts now match IPv4 clients on the dual-stack listener.** IPv4
+  peers were reported as `::ffff:a.b.c.d` and never matched trusted-host
+  entries like `192.168.1.10`; addresses are now normalized to plain IPv4
+  (also affects `source_ip` in events and history)
+- **No more panic on invalid send paths.** Sending a path with no final
+  component (e.g. ending in `..`) returns `EngineError::FileIo` instead of
+  panicking
+- Documentation examples no longer divide by zero on zero-byte transfers
+
+### Changed
+
+- **Receiver-side `TransferProgress` events now report transfer-wide totals,
+  matching the sender**: `bytes_transferred` accumulates across all files and
+  `total_bytes` is the whole transfer's size. Previously the receiver reported
+  per-file values, so progress bars disagreed between the two sides.
+  `current_file` still identifies the file in flight
+- `EngineEvent` is now `#[non_exhaustive]`; downstream `match` statements need
+  a wildcard arm
+- New dependency: `socket2` (multicast socket setup)
+
 ## [0.2.1] - 2026-01-17
 
 ### Fixed

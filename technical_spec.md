@@ -17,15 +17,16 @@ gosh-lan-transfer is a Rust library providing peer-to-peer file transfer capabil
 │  - Automatic history recording                               │
 ├─────────────────────────────────────────────────────────────┤
 │                                                              │
-│  ┌─────────────────┐          ┌─────────────────┐           │
-│  │  TransferClient │          │  TransferServer │           │
-│  │  (Sending)      │          │  (Receiving)    │           │
-│  │                 │          │                 │           │
-│  │  - DNS resolve  │          │  - HTTP server  │           │
-│  │  - File upload  │          │  - File receive │           │
-│  │  - Progress     │          │  - Approval     │           │
-│  │  - Retry logic  │          │  - Dir support  │           │
-│  └─────────────────┘          └─────────────────┘           │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────┐ │
+│  │  TransferClient │  │  TransferServer │  │  Discovery   │ │
+│  │  (Sending)      │  │  (Receiving)    │  │  (Multicast) │ │
+│  │                 │  │                 │  │              │ │
+│  │  - DNS resolve  │  │  - HTTP server  │  │  - Announce  │ │
+│  │  - File upload  │  │  - File receive │  │  - Listen    │ │
+│  │  - Progress     │  │  - Approval     │  │  - Peer table│ │
+│  │  - Retry logic  │  │  - Dir support  │  │  - Expiry    │ │
+│  │  - Throttling   │  │                 │  │              │ │
+│  └─────────────────┘  └─────────────────┘  └──────────────┘ │
 │                                                              │
 ├─────────────────────────────────────────────────────────────┤
 │  protocol (boundary types)     │  events (infrastructure)   │
@@ -84,6 +85,7 @@ gosh-lan-transfer is a Rust library providing peer-to-peer file transfer capabil
 - **tracing** (0.1) - Structured logging
 - **mime_guess** (2.x) - MIME type detection from file extensions
 - **local-ip-address** (0.6) - Network interface enumeration
+- **socket2** (0.5) - Multicast socket setup (SO_REUSEPORT, group join)
 - **hostname** (0.4) - System hostname retrieval
 - **bytes** (1.x) - Byte buffer utilities
 
@@ -127,6 +129,7 @@ struct TransferApprovalStatus {
 ### Event Payloads
 
 ```rust
+#[non_exhaustive]
 enum EngineEvent {
     TransferRequest(PendingTransfer),
     TransferProgress(TransferProgress),
@@ -136,13 +139,15 @@ enum EngineEvent {
     ServerStarted { port: u16 },
     ServerStopped,
     PortChanged { old_port: u16, new_port: u16 },
+    PeerDiscovered(DiscoveredPeer),
+    PeerLost { fingerprint: String, device_name: String },
 }
 
 struct TransferProgress {
     transfer_id: String,
-    current_file: Option<String>,
-    bytes_transferred: u64,
-    total_bytes: u64,
+    current_file: Option<String>,     // File currently in flight
+    bytes_transferred: u64,           // Cumulative across the whole transfer
+    total_bytes: u64,                 // Whole transfer size (both sides)
     speed_bps: u64,
 }
 ```
@@ -178,14 +183,18 @@ struct TransferRecord {
 
 ```rust
 struct EngineConfig {
-    port: u16,                           // Default: 53317
-    device_name: String,                 // Default: system hostname
-    download_dir: PathBuf,               // Default: current directory
-    trusted_hosts: Vec<String>,          // Default: empty
-    receive_only: bool,                  // Default: false
-    max_retries: u32,                    // Default: 3
-    retry_delay_ms: u64,                 // Default: 1000
-    bandwidth_limit_bps: Option<u64>,    // Default: None (unlimited)
+    port: u16,                              // Default: 53317
+    device_name: String,                    // Default: system hostname
+    download_dir: PathBuf,                  // Default: current directory
+    trusted_hosts: Vec<String>,             // Default: empty
+    receive_only: bool,                     // Default: false
+    max_retries: u32,                       // Default: 3
+    retry_delay_ms: u64,                    // Default: 1000
+    bandwidth_limit_bps: Option<u64>,       // Default: None (unlimited, send side)
+    discovery_multicast_addr: Ipv4Addr,     // Default: 224.0.0.167
+    discovery_port: u16,                    // Default: 53318 (UDP)
+    discovery_announce_interval_secs: u64,  // Default: 5
+    discovery_peer_timeout_secs: u64,       // Default: 15
 }
 ```
 
@@ -233,6 +242,42 @@ trait FavoritesPersistence: Send + Sync {
 - `file_id` - File ID within the transfer
 - `token` - Authorization token from approval
 
+## Peer Discovery
+
+Discovery uses UDP multicast on group `224.0.0.167`, port `53318` (both configurable). Each engine instance generates a random fingerprint (UUID v4) at creation.
+
+### Announcement Format
+
+JSON datagram, camelCase fields:
+
+```json
+{
+  "app": "gosh-lan-transfer",
+  "version": "0.3.0",
+  "fingerprint": "uuid-v4",
+  "deviceName": "My Device",
+  "port": 53317,
+  "announce": true
+}
+```
+
+### Behavior
+
+1. **Announce**: On start and every `discovery_announce_interval_secs` (default 5s), the engine multicasts an announcement with `announce: true`.
+2. **Listen**: Datagrams are validated (`app` must match, own fingerprint ignored, `port: 0` rejected, device names sanitized) and upserted into the peer table keyed by fingerprint. New peers emit `PeerDiscovered`.
+3. **Reply**: Multicast announcements (`announce: true`) trigger a unicast reply with `announce: false`, so the announcer learns about existing peers immediately. Replies never trigger further replies, preventing loops.
+4. **Expiry**: Peers not heard from within `discovery_peer_timeout_secs` (default 15s, three missed announcements) are removed and emit `PeerLost`.
+
+### Socket Setup
+
+The discovery socket binds `0.0.0.0:<discovery_port>` with `SO_REUSEADDR` and `SO_REUSEPORT` (required on macOS for multiple engines on one host) and enables multicast loopback so same-host peers can find each other. Discovery is IPv4-only; HTTP transfers remain dual-stack.
+
+### Limitations
+
+- Multicast is often filtered on VPNs, Tailscale, and some corporate networks; direct IP/hostname addressing remains the fallback.
+- The multicast join uses `INADDR_ANY`, so on multi-homed hosts the OS picks the interface.
+- macOS 14+ GUI apps may need Local Network permission before multicast works.
+
 ## Performance Considerations
 
 1. **Progress throttling**: Progress events are throttled to every 32KB to avoid flooding event handlers during high-speed transfers.
@@ -249,6 +294,8 @@ trait FavoritesPersistence: Send + Sync {
 
 7. **Directory transfers**: Files are collected recursively and sent with relative paths. The receiver creates subdirectories as needed under the download directory.
 
+8. **Bandwidth limiting**: When `bandwidth_limit_bps` is set, the sender paces outgoing chunks with a cumulative-rate throttle (sleeping just long enough to stay at or below the configured rate). The pacing window resets after 2 seconds of idle to prevent post-stall bursts. Receiving is never throttled.
+
 ## Security Considerations
 
 1. **Token-based authorization**: Upload tokens are UUID v4, providing 122 bits of randomness.
@@ -261,13 +308,16 @@ trait FavoritesPersistence: Send + Sync {
 
 5. **No authentication**: The library is designed for trusted networks (LAN, VPN, Tailscale). It does not implement user authentication.
 
-6. **Trust model**: Auto-acceptance only applies to explicitly configured trusted host IPs.
+6. **Trust model**: Auto-acceptance only applies to explicitly configured trusted host IPs. IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) are normalized to plain IPv4 before comparison.
+
+7. **Discovery is advisory only**: Multicast announcements are unauthenticated and spoofable. They only populate the peer list — device names are sanitized (control characters stripped, capped at 64 characters) and discovered peers receive no transfer permissions. Every transfer still goes through the approval or trusted-host flow.
 
 ## Infrastructure Requirements
 
 ### Network
 
-- TCP port 53317 (default, configurable)
+- TCP port 53317 (default, configurable) for transfers
+- UDP port 53318 (default, configurable) for multicast peer discovery (optional)
 - Server binds to [::] (IPv6 dual-stack) with fallback to 0.0.0.0 (IPv4)
 - Works across LAN, Tailscale, and VPN networks
 - Supports both IPv4 and IPv6 clients

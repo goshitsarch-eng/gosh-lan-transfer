@@ -25,7 +25,12 @@ use tokio::sync::broadcast;
 ///     fn on_event(&self, event: EngineEvent) {
 ///         match event {
 ///             EngineEvent::TransferProgress(p) => {
-///                 println!("Progress: {}%", (p.bytes_transferred * 100) / p.total_bytes);
+///                 let percent = if p.total_bytes > 0 {
+///                     (p.bytes_transferred * 100) / p.total_bytes
+///                 } else {
+///                     100
+///                 };
+///                 println!("Progress: {}%", percent);
 ///             }
 ///             _ => {}
 ///         }

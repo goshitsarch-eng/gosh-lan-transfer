@@ -92,7 +92,7 @@ impl HistoryPersistence for InMemoryHistory {
 
         // Return sorted by started_at descending (newest first)
         let mut sorted = records.clone();
-        sorted.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        sorted.sort_by_key(|r| std::cmp::Reverse(r.started_at));
         Ok(sorted)
     }
 
@@ -117,7 +117,7 @@ impl HistoryPersistence for InMemoryHistory {
         // Enforce max_records limit if set
         if self.max_records > 0 && records.len() > self.max_records {
             // Sort by started_at and keep only the newest
-            records.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+            records.sort_by_key(|r| std::cmp::Reverse(r.started_at));
             records.truncate(self.max_records);
         }
 

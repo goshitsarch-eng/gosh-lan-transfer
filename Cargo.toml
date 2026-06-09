@@ -1,6 +1,6 @@
 [package]
 name = "gosh-lan-transfer"
-version = "0.2.1"
+version = "0.3.0"
 description = "Core file transfer engine for LAN-based peer-to-peer file sharing"
 authors = ["Goshitsarch"]
 license = "MIT"
@@ -29,6 +29,7 @@ serde_json = "1"
 
 # Network utilities
 local-ip-address = "0.6"
+socket2 = { version = "0.5", features = ["all"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 hostname = "0.4"

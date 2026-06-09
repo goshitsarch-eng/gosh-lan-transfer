@@ -297,6 +297,14 @@ impl ServerState {
     pub async fn update_config(&self, config: EngineConfig) {
         *self.config.write().await = config;
     }
+
+    /// Roll back a failed file's bytes from the cumulative transfer counter
+    /// so a retried file doesn't inflate transfer-wide progress.
+    async fn rollback_file_bytes(&self, transfer_id: &str, bytes: u64) {
+        if let Some(total) = self.transfer_bytes.write().await.get_mut(transfer_id) {
+            *total = total.saturating_sub(bytes);
+        }
+    }
 }
 
 /// Handle for controlling a running server
@@ -459,7 +467,15 @@ async fn transfer_request_handler(
         computed_total
     );
 
-    let source_ip = addr.ip().to_string();
+    // Normalize IPv4-mapped IPv6 addresses (the dual-stack listener reports
+    // IPv4 clients as ::ffff:a.b.c.d, which would never match trusted hosts)
+    let source_ip = match addr.ip() {
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => v6.to_string(),
+        },
+        ip => ip.to_string(),
+    };
 
     // Create a pending transfer record
     let pending = PendingTransfer {
@@ -699,6 +715,9 @@ async fn chunk_upload_handler(
                     tracing::error!("Received more data than expected for {}", file_info.name);
                     drop(file);
                     let _ = tokio::fs::remove_file(&file_path).await;
+                    state
+                        .rollback_file_bytes(&params.transfer_id, bytes_received)
+                        .await;
                     return (
                         StatusCode::PAYLOAD_TOO_LARGE,
                         Json(serde_json::json!({"error": "Received more data than expected"})),
@@ -707,6 +726,11 @@ async fn chunk_upload_handler(
 
                 if let Err(e) = file.write_all(&data).await {
                     tracing::error!("Failed to write chunk: {}", e);
+                    drop(file);
+                    let _ = tokio::fs::remove_file(&file_path).await;
+                    state
+                        .rollback_file_bytes(&params.transfer_id, bytes_received)
+                        .await;
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(serde_json::json!({"error": format!("Failed to write: {}", e)})),
@@ -716,13 +740,14 @@ async fn chunk_upload_handler(
                 bytes_received = next_size;
 
                 // Update cumulative transfer bytes
-                {
+                let cumulative_bytes = {
                     let mut transfer_bytes = state.transfer_bytes.write().await;
                     let total = transfer_bytes
                         .entry(params.transfer_id.clone())
                         .or_insert(0);
                     *total += data.len() as u64;
-                }
+                    *total
+                };
 
                 // Throttle progress updates to every 32KB
                 if bytes_received - last_progress_bytes >= 32768 || bytes_received == file_info.size
@@ -732,14 +757,10 @@ async fn chunk_upload_handler(
                     // Calculate speed based on elapsed time
                     let speed_bps = {
                         let start_times = state.transfer_start_times.read().await;
-                        let transfer_bytes = state.transfer_bytes.read().await;
-                        if let (Some(start_time), Some(&total_bytes)) = (
-                            start_times.get(&params.transfer_id),
-                            transfer_bytes.get(&params.transfer_id),
-                        ) {
+                        if let Some(start_time) = start_times.get(&params.transfer_id) {
                             let elapsed_secs = start_time.elapsed().as_secs_f64();
                             if elapsed_secs > 0.0 {
-                                (total_bytes as f64 / elapsed_secs) as u64
+                                (cumulative_bytes as f64 / elapsed_secs) as u64
                             } else {
                                 0
                             }
@@ -748,18 +769,23 @@ async fn chunk_upload_handler(
                         }
                     };
 
-                    // Send progress update
+                    // Send transfer-wide progress (matches sender-side semantics)
                     state.emit_event(EngineEvent::TransferProgress(TransferProgress {
                         transfer_id: params.transfer_id.clone(),
                         current_file: Some(stored_name.clone()),
-                        bytes_transferred: bytes_received,
-                        total_bytes: file_info.size,
+                        bytes_transferred: cumulative_bytes,
+                        total_bytes: transfer.total_size,
                         speed_bps,
                     }));
                 }
             }
             Err(e) => {
                 tracing::error!("Error reading chunk: {}", e);
+                drop(file);
+                let _ = tokio::fs::remove_file(&file_path).await;
+                state
+                    .rollback_file_bytes(&params.transfer_id, bytes_received)
+                    .await;
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": format!("Stream error: {}", e)})),
@@ -768,9 +794,19 @@ async fn chunk_upload_handler(
         }
     }
 
-    // Ensure all data is flushed
+    // Ensure all data is flushed; a failed flush means the file may be
+    // incomplete on disk, so treat it as a failed upload.
     if let Err(e) = file.flush().await {
         tracing::error!("Failed to flush file: {}", e);
+        drop(file);
+        let _ = tokio::fs::remove_file(&file_path).await;
+        state
+            .rollback_file_bytes(&params.transfer_id, bytes_received)
+            .await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to flush file: {}", e)})),
+        );
     }
 
     if bytes_received != file_info.size {
@@ -781,6 +817,9 @@ async fn chunk_upload_handler(
             bytes_received
         );
         let _ = tokio::fs::remove_file(&file_path).await;
+        state
+            .rollback_file_bytes(&params.transfer_id, bytes_received)
+            .await;
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "Incomplete file received"})),

@@ -9,9 +9,10 @@
 //! ## Features
 //!
 //! - Send and receive files between peers
-//! - Automatic peer discovery via hostname resolution
+//! - Automatic peer discovery via UDP multicast (plus hostname resolution)
 //! - Trust-based auto-acceptance for known hosts
 //! - Progress tracking via events
+//! - Optional send-side bandwidth limiting
 //! - No cloud dependencies - all transfers are direct peer-to-peer
 //!
 //! ## Example
@@ -31,7 +32,11 @@
 //!     // Create event handler
 //!     let handler = callback_handler(|event| {
 //!         if let EngineEvent::TransferProgress(p) = event {
-//!             let percent = (p.bytes_transferred * 100) / p.total_bytes;
+//!             let percent = if p.total_bytes > 0 {
+//!                 (p.bytes_transferred * 100) / p.total_bytes
+//!             } else {
+//!                 100
+//!             };
 //!             println!("Progress: {}%", percent);
 //!         }
 //!     });
@@ -51,19 +56,21 @@
 
 pub mod client;
 pub mod config;
+pub mod discovery;
 pub mod error;
 pub mod events;
 pub mod favorites;
 pub mod history;
 pub mod protocol;
 pub mod server;
+mod throttle;
 pub mod types;
 
 // Protocol types (boundary-crossing messages)
 pub use protocol::{
-    EngineEvent, PeerInfo, PendingTransfer, TransferApprovalStatus, TransferDecision,
-    TransferDirection, TransferFile, TransferProgress, TransferRequest, TransferResponse,
-    TransferStatus,
+    DiscoveredPeer, DiscoveryAnnouncement, EngineEvent, PeerInfo, PendingTransfer,
+    TransferApprovalStatus, TransferDecision, TransferDirection, TransferFile, TransferProgress,
+    TransferRequest, TransferResponse, TransferStatus,
 };
 
 // Event handling infrastructure
@@ -75,6 +82,7 @@ pub use events::{
 // Engine components
 pub use client::{get_network_interfaces, TransferClient};
 pub use config::{EngineConfig, EngineConfigBuilder};
+pub use discovery::{DiscoveryHandle, DiscoveryState};
 pub use error::{EngineError, EngineResult};
 pub use favorites::{FavoritesPersistence, InMemoryFavorites};
 pub use history::{HistoryPersistence, InMemoryHistory};
@@ -97,6 +105,8 @@ pub struct GoshTransferEngine {
     client: TransferClient,
     server_state: Arc<ServerState>,
     server_handle: Option<ServerHandle>,
+    discovery_state: Arc<DiscoveryState>,
+    discovery_handle: Option<DiscoveryHandle>,
     event_handler: Arc<dyn EventHandler>,
     history: Option<Arc<dyn HistoryPersistence>>,
 }
@@ -105,6 +115,7 @@ impl GoshTransferEngine {
     /// Create a new engine with the given configuration and event handler
     pub fn new(config: EngineConfig, event_handler: Arc<dyn EventHandler>) -> Self {
         let server_state = Arc::new(ServerState::new(config.clone(), event_handler.clone()));
+        let discovery_state = Arc::new(DiscoveryState::new(config.clone(), event_handler.clone()));
         let client = TransferClient::new_with_config(event_handler.clone(), &config);
 
         Self {
@@ -112,6 +123,8 @@ impl GoshTransferEngine {
             client,
             server_state,
             server_handle: None,
+            discovery_state,
+            discovery_handle: None,
             event_handler,
             history: None,
         }
@@ -130,6 +143,7 @@ impl GoshTransferEngine {
             event_handler.clone(),
             history.clone(),
         ));
+        let discovery_state = Arc::new(DiscoveryState::new(config.clone(), event_handler.clone()));
         let client = TransferClient::new_with_history_and_config(
             event_handler.clone(),
             history.clone(),
@@ -141,6 +155,8 @@ impl GoshTransferEngine {
             client,
             server_state,
             server_handle: None,
+            discovery_state,
+            discovery_handle: None,
             event_handler,
             history: Some(history),
         }
@@ -342,6 +358,72 @@ impl GoshTransferEngine {
         Ok(())
     }
 
+    // === Peer Discovery ===
+
+    /// Start UDP multicast peer discovery
+    ///
+    /// Announces this device on the discovery multicast group and listens
+    /// for announcements from other devices. Discovered peers are reported
+    /// via `EngineEvent::PeerDiscovered` / `EngineEvent::PeerLost` and can
+    /// be listed with [`discovered_peers`](Self::discovered_peers).
+    pub async fn start_discovery(&mut self) -> EngineResult<()> {
+        if self.discovery_handle.is_some() {
+            return Err(EngineError::DiscoveryAlreadyRunning);
+        }
+
+        let handle = discovery::start_discovery(self.discovery_state.clone()).await?;
+        self.discovery_handle = Some(handle);
+        Ok(())
+    }
+
+    /// Stop peer discovery and clear the peer table
+    pub async fn stop_discovery(&mut self) -> EngineResult<()> {
+        match self.discovery_handle.take() {
+            Some(handle) => {
+                handle.shutdown();
+                self.discovery_state.clear_peers().await;
+                Ok(())
+            }
+            None => Err(EngineError::DiscoveryNotRunning),
+        }
+    }
+
+    /// Check if peer discovery is running
+    pub fn is_discovery_running(&self) -> bool {
+        self.discovery_handle.is_some()
+    }
+
+    /// Get a snapshot of currently discovered peers
+    pub async fn discovered_peers(&self) -> Vec<DiscoveredPeer> {
+        self.discovery_state.peers().await
+    }
+
+    /// Discover peers for a fixed duration and return what was found
+    ///
+    /// If discovery is not already running it is started for the duration
+    /// of the call and stopped afterwards. If discovery is already running,
+    /// this simply waits and returns a snapshot without stopping it.
+    pub async fn discover_peers(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> EngineResult<Vec<DiscoveredPeer>> {
+        let started_here = if self.discovery_handle.is_none() {
+            self.start_discovery().await?;
+            true
+        } else {
+            false
+        };
+
+        tokio::time::sleep(timeout).await;
+        let peers = self.discovered_peers().await;
+
+        if started_here {
+            self.stop_discovery().await?;
+        }
+
+        Ok(peers)
+    }
+
     // === Transfer Operations ===
 
     /// Send files to a peer
@@ -511,11 +593,14 @@ impl GoshTransferEngine {
 
     /// Update the engine configuration
     ///
-    /// This updates the engine config, client config, and server state config.
+    /// This updates the engine config, client config, server state config,
+    /// and discovery state config. Changes to discovery settings (multicast
+    /// group, port, intervals) take effect the next time discovery is started.
     pub async fn update_config(&mut self, config: EngineConfig) {
         self.client.update_config(&config);
         self.config = config.clone();
-        self.server_state.update_config(config).await;
+        self.server_state.update_config(config.clone()).await;
+        self.discovery_state.update_config(config).await;
     }
 
     /// Get the current configuration
@@ -547,6 +632,10 @@ impl Drop for GoshTransferEngine {
     fn drop(&mut self) {
         // Shutdown server if running
         if let Some(handle) = self.server_handle.take() {
+            handle.shutdown();
+        }
+        // Shutdown discovery if running
+        if let Some(handle) = self.discovery_handle.take() {
             handle.shutdown();
         }
     }

@@ -114,6 +114,46 @@ pub struct PeerInfo {
     pub version: String,
 }
 
+/// UDP multicast discovery announcement
+///
+/// Sent to the discovery multicast group to announce presence, and as a
+/// unicast reply so the announcer also learns about us. Replies have
+/// `announce: false` to prevent reply loops.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveryAnnouncement {
+    /// Application identifier; must equal "gosh-lan-transfer" to be accepted
+    pub app: String,
+    /// Library version of the announcer
+    pub version: String,
+    /// Stable per-engine-instance identifier (UUID v4)
+    pub fingerprint: String,
+    /// Device name shown to peers
+    pub device_name: String,
+    /// HTTP transfer port the announcer listens on
+    pub port: u16,
+    /// True for multicast announcements; false for unicast replies
+    pub announce: bool,
+}
+
+/// A peer found via multicast discovery
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredPeer {
+    /// Stable identifier of the peer engine instance
+    pub fingerprint: String,
+    /// Device name reported by the peer
+    pub device_name: String,
+    /// IP address the announcement came from
+    pub address: String,
+    /// HTTP transfer port the peer listens on
+    pub port: u16,
+    /// Library version reported by the peer
+    pub version: String,
+    /// When the peer was last heard from
+    pub last_seen: DateTime<Utc>,
+}
+
 // =============================================================================
 // Event Payload Types - Data carried in engine events
 // =============================================================================
@@ -161,6 +201,7 @@ pub struct PendingTransfer {
 /// These events cross the engine boundary and are delivered to consumers
 /// via the `EventHandler` trait.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum EngineEvent {
     /// New transfer request awaiting approval
     TransferRequest(PendingTransfer),
@@ -193,4 +234,13 @@ pub enum EngineEvent {
 
     /// Server port changed at runtime
     PortChanged { old_port: u16, new_port: u16 },
+
+    /// A peer was discovered via multicast discovery
+    PeerDiscovered(DiscoveredPeer),
+
+    /// A previously discovered peer stopped announcing and timed out
+    PeerLost {
+        fingerprint: String,
+        device_name: String,
+    },
 }

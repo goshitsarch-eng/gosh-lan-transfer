@@ -20,7 +20,7 @@ Sharing files between devices on the same network shouldn't require uploading to
 
 **LocalSend** offers a good user experience for casual file sharing, but it's an end-user application, not a library. If you're building your own file sharing feature into an application, you can't easily integrate it.
 
-gosh-lan-transfer takes a different approach. It's a library first, designed to be embedded into whatever application you're building. The HTTP-based protocol works across any platform that supports TCP. There's no proprietary discovery mechanism that might break across network boundaries, you simply specify the target device's IP or hostname. It works equally well on traditional LANs, corporate VPNs, and Tailscale networks where mDNS discovery often fails.
+gosh-lan-transfer takes a different approach. It's a library first, designed to be embedded into whatever application you're building. The HTTP-based protocol works across any platform that supports TCP. Discovery is optional: you can always specify the target device's IP or hostname directly, which works equally well on traditional LANs, corporate VPNs, and Tailscale networks where mDNS discovery often fails. On networks that allow multicast, the built-in UDP multicast discovery finds nearby peers automatically.
 
 The library handles the complexity of file transfer progress tracking, approval workflows, retry logic, directory transfers, while staying out of your way on everything else. You provide the UI, the storage backend, and the user experience. gosh-lan-transfer provides reliable, fast, direct transfers.
 
@@ -38,7 +38,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-gosh-lan-transfer = "0.2"
+gosh-lan-transfer = "0.3"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -73,7 +73,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         transfer.source_ip, transfer.files.len());
                 }
                 EngineEvent::TransferProgress(progress) => {
-                    let percent = (progress.bytes_transferred * 100) / progress.total_bytes;
+                    let percent = if progress.total_bytes > 0 {
+                        (progress.bytes_transferred * 100) / progress.total_bytes
+                    } else {
+                        100
+                    };
                     println!("Progress: {}%", percent);
                 }
                 EngineEvent::TransferComplete { transfer_id } => {
@@ -139,6 +143,8 @@ src/
 ├── error.rs        # EngineError
 ├── client.rs       # TransferClient (internal)
 ├── server.rs       # HTTP server (internal)
+├── discovery.rs    # UDP multicast peer discovery
+├── throttle.rs     # Send-side bandwidth pacing (internal)
 ├── favorites.rs    # FavoritesPersistence trait
 └── history.rs      # HistoryPersistence trait
 ```
@@ -301,6 +307,33 @@ let info = engine.get_peer_info("192.168.1.100", 53317).await?;
 println!("Peer name: {}", info["name"]);
 ```
 
+#### Peer Discovery
+
+Devices running gosh-lan-transfer can find each other automatically via UDP multicast (group `224.0.0.167`, UDP port `53318` by default). Each engine periodically announces its device name and transfer port; listeners maintain a peer table, reply so the announcer learns about them too, and expire peers that stop announcing.
+
+```rust
+use std::time::Duration;
+
+// One-shot: scan for 3 seconds and return what was found
+let peers = engine.discover_peers(Duration::from_secs(3)).await?;
+for peer in peers {
+    println!("{} at {}:{}", peer.device_name, peer.address, peer.port);
+}
+
+// Or run discovery continuously and react to events
+engine.start_discovery().await?;
+// ... EngineEvent::PeerDiscovered / EngineEvent::PeerLost arrive as peers come and go
+let peers = engine.discovered_peers().await; // snapshot at any time
+engine.stop_discovery().await?;
+```
+
+Discovery is advisory only: announcements are unauthenticated, so the peer list is a convenience for the UI, never an authorization. Incoming transfers still require explicit approval or a trusted-host entry.
+
+Notes for multicast environments:
+- UDP port 53318 must be open in the firewall for discovery to work; file transfers themselves only need the TCP transfer port.
+- On macOS 14+, GUI applications embedding this library may trigger the Local Network privacy prompt before multicast works.
+- Multicast is often filtered on VPNs and Tailscale; direct IP/hostname addressing always remains available.
+
 #### Configuration Management
 
 Configuration can be updated at runtime. Trusted hosts determine which peers can send files without requiring manual approval.
@@ -338,10 +371,14 @@ let config = EngineConfig::builder()
     .receive_only(false)                      // Allow sending
     .max_retries(3)                           // Retry failed transfers
     .retry_delay_ms(1000)                     // Delay between retries
+    .bandwidth_limit_bps(Some(5_000_000))     // Cap outgoing transfers at ~5 MB/s
+    .discovery_port(53318)                    // UDP port for peer discovery
+    .discovery_announce_interval_secs(5)      // How often to announce
+    .discovery_peer_timeout_secs(15)          // When silent peers are considered lost
     .build();
 ```
 
-The defaults use port 53317, the system hostname as the device name, the current directory for downloads, no trusted hosts, and three retry attempts with a one-second base delay.
+The defaults use port 53317, the system hostname as the device name, the current directory for downloads, no trusted hosts, three retry attempts with a one-second base delay, and no bandwidth limit. `bandwidth_limit_bps` throttles the send side only; receiving is never rate-limited.
 
 ### Events
 
@@ -382,8 +419,22 @@ match event {
     EngineEvent::PortChanged { old_port, new_port } => {
         // Server port changed at runtime
     }
+
+    EngineEvent::PeerDiscovered(peer) => {
+        // A peer was found via multicast discovery
+    }
+
+    EngineEvent::PeerLost { fingerprint, device_name } => {
+        // A discovered peer stopped announcing and timed out
+    }
+
+    _ => {
+        // EngineEvent is #[non_exhaustive]; future versions may add variants
+    }
 }
 ```
+
+`TransferProgress` events report transfer-wide totals on both the sending and receiving side: `bytes_transferred` accumulates across all files in the transfer and `total_bytes` is the size of the whole transfer, with `current_file` naming the file currently in flight.
 
 ### Event Handlers
 
@@ -523,6 +574,8 @@ SENDER                                    RECEIVER
 
 Each approved transfer receives a unique UUID token that must accompany all file uploads, preventing unauthorized data injection. Received filenames are sanitized to prevent path traversal attacks only the filename component is used, and parent directory references are stripped. Files exceeding their declared size are rejected and deleted.
 
+Discovery announcements are unauthenticated UDP datagrams and can be spoofed by anyone on the local network. They only populate the peer list: device names are sanitized (control characters stripped, length capped), and discovering a peer never grants it transfer permissions — every incoming transfer still goes through the approval or trusted-host flow.
+
 The library is designed for trusted networks and does not implement user authentication. If you need transfers over untrusted networks, layer TLS on top or use a VPN.
 
 ## Examples
@@ -546,7 +599,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let handler = callback_handler(|event| {
         if let EngineEvent::TransferProgress(p) = event {
-            let pct = (p.bytes_transferred * 100) / p.total_bytes;
+            let pct = if p.total_bytes > 0 {
+                (p.bytes_transferred * 100) / p.total_bytes
+            } else {
+                100
+            };
             eprint!("\rSending: {}%  ", pct);
         }
     });
@@ -593,7 +650,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 engine.accept_transfer(&transfer.id).await?;
             }
             EngineEvent::TransferProgress(p) => {
-                let pct = (p.bytes_transferred * 100) / p.total_bytes;
+                let pct = if p.total_bytes > 0 {
+                    (p.bytes_transferred * 100) / p.total_bytes
+                } else {
+                    100
+                };
                 eprint!("\rReceiving: {}%  ", pct);
             }
             EngineEvent::TransferComplete { .. } => {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // gosh-lan-transfer - Engine configuration
 
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 /// Engine configuration
@@ -23,6 +24,14 @@ pub struct EngineConfig {
     pub retry_delay_ms: u64,
     /// Optional bandwidth limit in bytes per second (None = unlimited)
     pub bandwidth_limit_bps: Option<u64>,
+    /// Multicast group used for peer discovery (default: 224.0.0.167)
+    pub discovery_multicast_addr: Ipv4Addr,
+    /// UDP port used for peer discovery (default: 53318)
+    pub discovery_port: u16,
+    /// Seconds between discovery announcements (default: 5)
+    pub discovery_announce_interval_secs: u64,
+    /// Seconds without an announcement before a peer is considered lost (default: 15)
+    pub discovery_peer_timeout_secs: u64,
 }
 
 impl Default for EngineConfig {
@@ -38,6 +47,10 @@ impl Default for EngineConfig {
             max_retries: 3,
             retry_delay_ms: 1000,
             bandwidth_limit_bps: None,
+            discovery_multicast_addr: Ipv4Addr::new(224, 0, 0, 167),
+            discovery_port: 53318,
+            discovery_announce_interval_secs: 5,
+            discovery_peer_timeout_secs: 15,
         }
     }
 }
@@ -65,6 +78,10 @@ pub struct EngineConfigBuilder {
     max_retries: Option<u32>,
     retry_delay_ms: Option<u64>,
     bandwidth_limit_bps: Option<Option<u64>>,
+    discovery_multicast_addr: Option<Ipv4Addr>,
+    discovery_port: Option<u16>,
+    discovery_announce_interval_secs: Option<u64>,
+    discovery_peer_timeout_secs: Option<u64>,
 }
 
 impl EngineConfigBuilder {
@@ -124,6 +141,30 @@ impl EngineConfigBuilder {
         self
     }
 
+    /// Set the multicast group used for peer discovery
+    pub fn discovery_multicast_addr(mut self, addr: Ipv4Addr) -> Self {
+        self.discovery_multicast_addr = Some(addr);
+        self
+    }
+
+    /// Set the UDP port used for peer discovery
+    pub fn discovery_port(mut self, port: u16) -> Self {
+        self.discovery_port = Some(port);
+        self
+    }
+
+    /// Set the seconds between discovery announcements
+    pub fn discovery_announce_interval_secs(mut self, secs: u64) -> Self {
+        self.discovery_announce_interval_secs = Some(secs);
+        self
+    }
+
+    /// Set the seconds without an announcement before a peer is considered lost
+    pub fn discovery_peer_timeout_secs(mut self, secs: u64) -> Self {
+        self.discovery_peer_timeout_secs = Some(secs);
+        self
+    }
+
     /// Build the configuration
     pub fn build(self) -> EngineConfig {
         let default = EngineConfig::default();
@@ -138,6 +179,16 @@ impl EngineConfigBuilder {
             bandwidth_limit_bps: self
                 .bandwidth_limit_bps
                 .unwrap_or(default.bandwidth_limit_bps),
+            discovery_multicast_addr: self
+                .discovery_multicast_addr
+                .unwrap_or(default.discovery_multicast_addr),
+            discovery_port: self.discovery_port.unwrap_or(default.discovery_port),
+            discovery_announce_interval_secs: self
+                .discovery_announce_interval_secs
+                .unwrap_or(default.discovery_announce_interval_secs),
+            discovery_peer_timeout_secs: self
+                .discovery_peer_timeout_secs
+                .unwrap_or(default.discovery_peer_timeout_secs),
         }
     }
 }

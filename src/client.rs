@@ -8,6 +8,7 @@ use crate::config::EngineConfig;
 use crate::error::{EngineError, EngineResult};
 use crate::events::EventHandler;
 use crate::history::HistoryPersistence;
+use crate::throttle::Throttle;
 use crate::protocol::{
     EngineEvent, TransferApprovalStatus, TransferDecision, TransferFile, TransferProgress,
     TransferRequest, TransferResponse,
@@ -42,6 +43,8 @@ pub struct TransferClient {
     max_retries: u32,
     /// Base delay between retries in milliseconds
     retry_delay_ms: u64,
+    /// Optional send-side bandwidth limit in bytes per second
+    bandwidth_limit_bps: Option<u64>,
 }
 
 /// Parameters for sending a single file
@@ -80,6 +83,7 @@ impl TransferClient {
             history: None,
             max_retries: config.max_retries,
             retry_delay_ms: config.retry_delay_ms,
+            bandwidth_limit_bps: config.bandwidth_limit_bps,
         }
     }
 
@@ -110,13 +114,15 @@ impl TransferClient {
             history: Some(history),
             max_retries: config.max_retries,
             retry_delay_ms: config.retry_delay_ms,
+            bandwidth_limit_bps: config.bandwidth_limit_bps,
         }
     }
 
-    /// Update retry settings from config
+    /// Update retry and bandwidth settings from config
     pub fn update_config(&mut self, config: &EngineConfig) {
         self.max_retries = config.max_retries;
         self.retry_delay_ms = config.retry_delay_ms;
+        self.bandwidth_limit_bps = config.bandwidth_limit_bps;
     }
 
     /// Check if an error is transient and should be retried
@@ -371,7 +377,12 @@ impl TransferClient {
         let file_name = params
             .file_path
             .file_name()
-            .unwrap()
+            .ok_or_else(|| {
+                EngineError::FileIo(format!(
+                    "Invalid file path: {}",
+                    params.file_path.display()
+                ))
+            })?
             .to_string_lossy()
             .to_string();
         let last_update = Arc::new(AtomicU64::new(0));
@@ -415,13 +426,35 @@ impl TransferClient {
             }
         });
 
+        // Apply send-side bandwidth limiting if configured. The Arc<Mutex>
+        // only satisfies `then`'s borrow rules; the stream is polled
+        // sequentially so there is no contention.
+        let body_stream: futures::stream::BoxStream<'static, std::io::Result<bytes::Bytes>> =
+            match self.bandwidth_limit_bps.filter(|rate| *rate > 0) {
+                Some(rate) => {
+                    let throttle = Arc::new(tokio::sync::Mutex::new(Throttle::new(rate)));
+                    stream
+                        .then(move |chunk| {
+                            let throttle = throttle.clone();
+                            async move {
+                                if let Ok(ref bytes) = chunk {
+                                    throttle.lock().await.pace(bytes.len()).await;
+                                }
+                                chunk
+                            }
+                        })
+                        .boxed()
+                }
+                None => stream.boxed(),
+            };
+
         // Send the file
         let response = self
             .http_client
             .post(&url)
             .header("Content-Type", "application/octet-stream")
             .header("Content-Length", file_size)
-            .body(Body::wrap_stream(stream))
+            .body(Body::wrap_stream(body_stream))
             .send()
             .await
             .map_err(|e| EngineError::Network(format!("Failed to send file: {}", e)))?;

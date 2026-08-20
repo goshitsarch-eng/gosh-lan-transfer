@@ -253,7 +253,7 @@ JSON datagram, camelCase fields:
 ```json
 {
   "app": "gosh-lan-transfer",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "fingerprint": "uuid-v4",
   "deviceName": "My Device",
   "port": 53317,

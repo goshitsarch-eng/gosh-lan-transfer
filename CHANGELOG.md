@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-20
+
 ### Fixed
 
 - **Pending transfer list no longer shows accepted or rejected items.** `get_pending_transfers()` previously returned every request still in memory, so UIs kept displaying transfers after accept/reject. Rejected requests are dropped from the pending map; accepted in-flight transfers are filtered out.

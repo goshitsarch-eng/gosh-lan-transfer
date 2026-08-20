@@ -1,6 +1,6 @@
 [package]
 name = "gosh-lan-transfer"
-version = "0.3.0"
+version = "0.3.1"
 description = "Core file transfer engine for LAN-based peer-to-peer file sharing"
 authors = ["Goshitsarch"]
 license = "MIT"

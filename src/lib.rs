@@ -45,7 +45,7 @@
 //!     let mut engine = GoshTransferEngine::new(config, handler);
 //!
 //!     // Start server to receive files
-//!     let handle = engine.start_server().await?;
+//!     engine.start_server().await?;
 //!
 //!     // Send files to a peer
 //!     engine.send_files("192.168.1.100", 53317, vec!["/path/to/file.txt".into()]).await?;
@@ -194,8 +194,8 @@ impl GoshTransferEngine {
 
     /// Start the HTTP server for receiving files
     ///
-    /// The server binds to all interfaces (0.0.0.0) on the configured port.
-    /// Returns a handle that can be used to stop the server.
+    /// The server binds to `[::]` (IPv6 dual-stack) on the configured port,
+    /// falling back to `0.0.0.0` if IPv6 is unavailable.
     pub async fn start_server(&mut self) -> EngineResult<()> {
         if self.server_handle.is_some() {
             return Err(EngineError::ServerAlreadyRunning);

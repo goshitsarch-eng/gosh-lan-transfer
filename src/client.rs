@@ -8,11 +8,11 @@ use crate::config::EngineConfig;
 use crate::error::{EngineError, EngineResult};
 use crate::events::EventHandler;
 use crate::history::HistoryPersistence;
-use crate::throttle::Throttle;
 use crate::protocol::{
     EngineEvent, TransferApprovalStatus, TransferDecision, TransferFile, TransferProgress,
     TransferRequest, TransferResponse,
 };
+use crate::throttle::Throttle;
 use crate::types::{
     NetworkInterface, ResolveResult, TransferDirection, TransferRecord, TransferStatus,
 };
@@ -33,6 +33,41 @@ use tokio::{
 };
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
+
+/// Format `host:port` for use in an HTTP URL.
+///
+/// IPv6 literals must be wrapped in brackets (`[::1]:53317`). Unbracketed
+/// IPv6 addresses produced `http://::1:53317/...`, which is not a valid URL
+/// and caused send/health/info calls to fail (and UIs to show blank peer
+/// sections).
+pub(crate) fn format_host_port(address: &str, port: u16) -> String {
+    let host = address.trim();
+    if host.starts_with('[') {
+        if let Some(end) = host.find(']') {
+            let inside = &host[1..end];
+            return format!("[{}]:{}", inside, port);
+        }
+    }
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    }
+}
+
+/// Build an `http://host:port/path` URL, bracketing IPv6 hosts.
+pub(crate) fn http_url(address: &str, port: u16, path_and_query: &str) -> String {
+    let path = if path_and_query.starts_with('/') {
+        path_and_query
+    } else {
+        return format!(
+            "http://{}/{}",
+            format_host_port(address, port),
+            path_and_query
+        );
+    };
+    format!("http://{}{}", format_host_port(address, port), path)
+}
 
 /// Client for sending files to a peer
 pub struct TransferClient {
@@ -191,7 +226,7 @@ impl TransferClient {
 
     /// Check if a peer is reachable by hitting the /health endpoint
     pub async fn check_peer(&self, address: &str, port: u16) -> EngineResult<bool> {
-        let url = format!("http://{}:{}/health", address, port);
+        let url = http_url(address, port, "/health");
 
         match self.http_client.get(&url).send().await {
             Ok(response) => {
@@ -224,7 +259,7 @@ impl TransferClient {
 
     /// Get peer info
     pub async fn get_peer_info(&self, address: &str, port: u16) -> EngineResult<serde_json::Value> {
-        let url = format!("http://{}:{}/info", address, port);
+        let url = http_url(address, port, "/info");
 
         let response = self
             .http_client
@@ -257,7 +292,7 @@ impl TransferClient {
             total_size,
         };
 
-        let url = format!("http://{}:{}/transfer", address, port);
+        let url = http_url(address, port, "/transfer");
 
         let mut last_error = None;
         for attempt in 0..=self.max_retries {
@@ -265,6 +300,28 @@ impl TransferClient {
 
             match result {
                 Ok(response) => {
+                    let status = response.status();
+                    if !status.is_success() {
+                        let error_text = response.text().await.unwrap_or_default();
+                        let error = EngineError::Network(format!(
+                            "Transfer request failed ({}): {}",
+                            status, error_text
+                        ));
+                        // Retry server-side failures; 4xx is a definitive rejection
+                        if status.is_server_error() && attempt < self.max_retries {
+                            self.event_handler.on_event(EngineEvent::TransferRetry {
+                                transfer_id: transfer_id.to_string(),
+                                attempt: attempt + 1,
+                                max_attempts: self.max_retries,
+                                error: error.to_string(),
+                            });
+                            let delay = self.retry_delay_ms * 2u64.pow(attempt);
+                            sleep(Duration::from_millis(delay)).await;
+                            last_error = Some(error);
+                            continue;
+                        }
+                        return Err(error);
+                    }
                     let transfer_response: TransferResponse =
                         response.json().await.map_err(|e| {
                             EngineError::Serialization(format!("Failed to parse response: {}", e))
@@ -312,9 +369,10 @@ impl TransferClient {
         port: u16,
         transfer_id: &str,
     ) -> EngineResult<TransferApprovalStatus> {
-        let url = format!(
-            "http://{}:{}/transfer/status?transfer_id={}",
-            address, port, transfer_id
+        let url = http_url(
+            address,
+            port,
+            &format!("/transfer/status?transfer_id={}", transfer_id),
         );
         let timeout = Duration::from_secs(120);
         let poll_interval = Duration::from_millis(500);
@@ -354,9 +412,13 @@ impl TransferClient {
 
     /// Send a file to a peer (after transfer is accepted)
     async fn send_file(&self, params: SendFileParams<'_>) -> EngineResult<()> {
-        let url = format!(
-            "http://{}:{}/chunk?transfer_id={}&file_id={}&token={}",
-            params.address, params.port, params.transfer_id, params.file_id, params.token
+        let url = http_url(
+            params.address,
+            params.port,
+            &format!(
+                "/chunk?transfer_id={}&file_id={}&token={}",
+                params.transfer_id, params.file_id, params.token
+            ),
         );
 
         // Open and read the file
@@ -378,17 +440,36 @@ impl TransferClient {
             .file_path
             .file_name()
             .ok_or_else(|| {
-                EngineError::FileIo(format!(
-                    "Invalid file path: {}",
-                    params.file_path.display()
-                ))
+                EngineError::FileIo(format!("Invalid file path: {}", params.file_path.display()))
             })?
             .to_string_lossy()
             .to_string();
         let last_update = Arc::new(AtomicU64::new(0));
         let total_transfer_size = params.total_transfer_size;
 
-        let stream = ReaderStream::new(file).inspect({
+        // Pace first (if limited), then record progress. Progress used to be
+        // attached to the disk-read stream *before* the throttle, so UIs would
+        // jump to 100% immediately and then stall while bytes actually left.
+        let paced: futures::stream::BoxStream<'static, std::io::Result<bytes::Bytes>> =
+            match self.bandwidth_limit_bps.filter(|rate| *rate > 0) {
+                Some(rate) => {
+                    let throttle = Arc::new(tokio::sync::Mutex::new(Throttle::new(rate)));
+                    ReaderStream::new(file)
+                        .then(move |chunk| {
+                            let throttle = throttle.clone();
+                            async move {
+                                if let Ok(ref bytes) = chunk {
+                                    throttle.lock().await.pace(bytes.len()).await;
+                                }
+                                chunk
+                            }
+                        })
+                        .boxed()
+                }
+                None => ReaderStream::new(file).boxed(),
+            };
+
+        let body_stream = paced.inspect({
             let event_handler = event_handler.clone();
             let transfer_id = transfer_id_owned.clone();
             let file_name = file_name.clone();
@@ -426,28 +507,6 @@ impl TransferClient {
             }
         });
 
-        // Apply send-side bandwidth limiting if configured. The Arc<Mutex>
-        // only satisfies `then`'s borrow rules; the stream is polled
-        // sequentially so there is no contention.
-        let body_stream: futures::stream::BoxStream<'static, std::io::Result<bytes::Bytes>> =
-            match self.bandwidth_limit_bps.filter(|rate| *rate > 0) {
-                Some(rate) => {
-                    let throttle = Arc::new(tokio::sync::Mutex::new(Throttle::new(rate)));
-                    stream
-                        .then(move |chunk| {
-                            let throttle = throttle.clone();
-                            async move {
-                                if let Ok(ref bytes) = chunk {
-                                    throttle.lock().await.pace(bytes.len()).await;
-                                }
-                                chunk
-                            }
-                        })
-                        .boxed()
-                }
-                None => stream.boxed(),
-            };
-
         // Send the file
         let response = self
             .http_client
@@ -460,10 +519,11 @@ impl TransferClient {
             .map_err(|e| EngineError::Network(format!("Failed to send file: {}", e)))?;
 
         if !response.status().is_success() {
+            let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
             return Err(EngineError::Network(format!(
-                "Server returned error: {}",
-                error_text
+                "Server returned error ({}): {}",
+                status, error_text
             )));
         }
 
@@ -495,6 +555,10 @@ impl TransferClient {
         file_paths: Vec<PathBuf>,
         sender_name: Option<String>,
     ) -> EngineResult<()> {
+        if file_paths.is_empty() {
+            return Err(EngineError::InvalidConfig("No files to send".to_string()));
+        }
+
         let transfer_id = Uuid::new_v4().to_string();
         let started_at = chrono::Utc::now();
 
@@ -504,6 +568,13 @@ impl TransferClient {
             let metadata = tokio::fs::metadata(path)
                 .await
                 .map_err(|e| EngineError::FileIo(format!("Failed to get file info: {}", e)))?;
+
+            if !metadata.is_file() {
+                return Err(EngineError::FileIo(format!(
+                    "Not a regular file: {}",
+                    path.display()
+                )));
+            }
 
             let name = path
                 .file_name()
@@ -937,23 +1008,39 @@ impl TransferClient {
             .await
             .map_err(|e| EngineError::FileIo(format!("Failed to read directory: {}", e)))?;
 
-        while let Some(entry) = entries.next_entry().await.map_err(|e| {
-            EngineError::FileIo(format!("Failed to read directory entry: {}", e))
-        })? {
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| EngineError::FileIo(format!("Failed to read directory entry: {}", e)))?
+        {
             let path = entry.path();
-            let file_type = entry.file_type().await.map_err(|e| {
-                EngineError::FileIo(format!("Failed to get file type: {}", e))
-            })?;
+            let file_type = entry
+                .file_type()
+                .await
+                .map_err(|e| EngineError::FileIo(format!("Failed to get file type: {}", e)))?;
 
-            if file_type.is_file() {
+            if file_type.is_dir() {
+                // Do not recurse into symlink directories (avoids cycles and
+                // sending files from outside the requested tree).
+                Box::pin(Self::collect_directory_files_async(base_path, &path, files)).await?;
+            } else if file_type.is_file()
+                || (file_type.is_symlink()
+                    && tokio::fs::metadata(&path)
+                        .await
+                        .map(|m| m.is_file())
+                        .unwrap_or(false))
+            {
+                // Portable wire path: always `/`, never OS-specific separators.
                 let relative = path
                     .strip_prefix(base_path)
-                    .map_err(|_| EngineError::FileIo("Failed to calculate relative path".to_string()))?
-                    .to_string_lossy()
-                    .to_string();
+                    .map_err(|_| {
+                        EngineError::FileIo("Failed to calculate relative path".to_string())
+                    })?
+                    .iter()
+                    .map(|s| s.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
                 files.push((path, relative));
-            } else if file_type.is_dir() {
-                Box::pin(Self::collect_directory_files_async(base_path, &path, files)).await?;
             }
         }
 
@@ -977,4 +1064,33 @@ pub fn get_network_interfaces() -> Vec<NetworkInterface> {
     }
 
     interfaces
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_host_port_ipv4_and_hostname() {
+        assert_eq!(format_host_port("127.0.0.1", 53317), "127.0.0.1:53317");
+        assert_eq!(format_host_port("localhost", 80), "localhost:80");
+        assert_eq!(format_host_port(" 192.168.1.5 ", 9), "192.168.1.5:9");
+    }
+
+    #[test]
+    fn format_host_port_brackets_ipv6() {
+        assert_eq!(format_host_port("::1", 53317), "[::1]:53317");
+        assert_eq!(format_host_port("2001:db8::1", 8080), "[2001:db8::1]:8080");
+        assert_eq!(format_host_port("[::1]", 53317), "[::1]:53317");
+        assert_eq!(format_host_port("[::1]:ignored", 9), "[::1]:9");
+    }
+
+    #[test]
+    fn http_url_ipv6_is_valid() {
+        assert_eq!(
+            http_url("::1", 53317, "/health"),
+            "http://[::1]:53317/health"
+        );
+        assert_eq!(http_url("127.0.0.1", 1, "/info"), "http://127.0.0.1:1/info");
+    }
 }

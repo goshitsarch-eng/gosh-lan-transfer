@@ -120,12 +120,18 @@ impl DiscoveryState {
             last_seen: chrono::Utc::now(),
         };
 
-        let is_new = {
+        let previous = {
             let mut peers = self.peers.write().await;
-            peers.insert(msg.fingerprint.clone(), peer.clone()).is_none()
+            peers.insert(msg.fingerprint.clone(), peer.clone())
         };
 
-        if is_new {
+        let identity_changed = previous.as_ref().is_some_and(|old| {
+            old.device_name != peer.device_name
+                || old.address != peer.address
+                || old.port != peer.port
+        });
+
+        if previous.is_none() || identity_changed {
             tracing::info!(
                 "Discovered peer: {} at {}:{}",
                 peer.device_name,
@@ -340,6 +346,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_packet_emits_again_when_device_name_changes() {
+        let (handler, mut events) = channel_handler(16);
+        let config = EngineConfig::builder().device_name("Receiver").build();
+        let state = Arc::new(DiscoveryState::new(config, handler));
+
+        let packet = announcement_from("peer-1", "Old Name", 53317, false);
+        state.handle_packet(&packet, src()).await;
+        let _ = events.try_recv();
+
+        let packet = announcement_from("peer-1", "New Name", 53317, false);
+        state.handle_packet(&packet, src()).await;
+
+        match events.try_recv().unwrap() {
+            EngineEvent::PeerDiscovered(p) => {
+                assert_eq!(p.fingerprint, "peer-1");
+                assert_eq!(p.device_name, "New Name");
+            }
+            other => panic!("expected PeerDiscovered on rename, got {:?}", other),
+        }
+
+        // Same identity again should not emit
+        let packet = announcement_from("peer-1", "New Name", 53317, false);
+        state.handle_packet(&packet, src()).await;
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn test_handle_packet_reply_does_not_reply_again() {
         let state = test_state();
         let packet = announcement_from("peer-1", "Sender", 53317, false);
@@ -368,7 +401,10 @@ mod tests {
         let wrong_app = serde_json::to_vec(&wrong_app).unwrap();
 
         assert!(state.handle_packet(&wrong_app, src()).await.is_none());
-        assert!(state.handle_packet(b"not json at all", src()).await.is_none());
+        assert!(state
+            .handle_packet(b"not json at all", src())
+            .await
+            .is_none());
         assert!(state.handle_packet(&[], src()).await.is_none());
         assert!(state.peers().await.is_empty());
     }

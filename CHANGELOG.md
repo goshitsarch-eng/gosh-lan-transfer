@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Pending transfer list no longer shows accepted or rejected items.** `get_pending_transfers()` previously returned every request still in memory, so UIs kept displaying transfers after accept/reject. Rejected requests are dropped from the pending map; accepted in-flight transfers are filtered out.
+- **IPv6 send/health/info URLs are now valid.** Unbracketed addresses such as `::1` produced `http://::1:53317/...`, which failed to parse. Peer sections that listed IPv6 interfaces could not connect.
+- **`/info` includes `deviceName`.** Discovery and `PeerInfo` use `deviceName`; `/info` only returned `name`, so UIs that read `deviceName` showed a blank device section.
+- **SSE progress events use `transferProgress` and stay valid JSON.** The stream previously tagged progress as `progress` and, on lag, emitted a non-JSON `heartbeat` payload that broke browser parsers. Idle connections now use SSE comments / keep-alives.
+- **CORS headers on the HTTP API.** `tower-http` CORS was a dependency but never applied, so browser UIs could not read `/info` or `/events`.
+- **Directory transfers cannot write outside the download directory.** A relative path of only `..` components joined to the download dir itself and then used `.parent()`, creating files beside (not inside) the download folder.
+- **Windows-style `\` relative paths recreate directories on Unix** instead of saving a single oddly named file.
+- **Empty file lists are rejected** on both send and receive, so a sender cannot report complete while the receiver stays pending forever.
+- **Accept is idempotent.** Re-accepting (including `accept_all_transfers`) no longer rotates the upload token of an in-progress transfer.
+- **Progress events fire after send-side bandwidth pacing**, so progress bars no longer jump to 100% and freeze while the throttle catches up.
+- **Peer display names update.** A later announcement with a new device name or address re-emits `PeerDiscovered` so UIs can upsert instead of showing a stale label.
+
+### Changed
+
+- Sending a path that is not a regular file now returns `EngineError::FileIo` instead of attempting to stream a directory.
+- Symlink-to-file entries are included in directory transfers; symlink directories are still not followed.
+
 ## [0.3.0] - 2026-06-09
 
 ### Added

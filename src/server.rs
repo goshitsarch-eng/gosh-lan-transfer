@@ -7,8 +7,11 @@
 use axum::{
     body::Body,
     extract::{ConnectInfo, Query, State},
-    http::StatusCode,
-    response::{IntoResponse, Sse},
+    http::{Method, StatusCode},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse,
+    },
     routing::{get, post},
     Json, Router,
 };
@@ -16,6 +19,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
+    convert::Infallible,
     io::ErrorKind,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -27,6 +31,7 @@ use tokio::{
     sync::{broadcast, oneshot, RwLock},
 };
 use tokio_stream::wrappers::BroadcastStream;
+use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
 use crate::config::EngineConfig;
@@ -72,7 +77,7 @@ enum InternalEvent {
     TransferRequest {
         transfer: PendingTransfer,
     },
-    Progress {
+    TransferProgress {
         progress: TransferProgress,
     },
     TransferComplete {
@@ -143,7 +148,7 @@ impl ServerState {
         // Also send to internal SSE channel
         let internal = match event {
             EngineEvent::TransferRequest(transfer) => InternalEvent::TransferRequest { transfer },
-            EngineEvent::TransferProgress(progress) => InternalEvent::Progress { progress },
+            EngineEvent::TransferProgress(progress) => InternalEvent::TransferProgress { progress },
             EngineEvent::TransferComplete { transfer_id } => {
                 InternalEvent::TransferComplete { transfer_id }
             }
@@ -187,6 +192,19 @@ impl ServerState {
 
     /// Accept a pending transfer
     pub async fn accept_transfer(&self, transfer_id: &str) -> EngineResult<String> {
+        if self.cancelled_transfers.read().await.contains(transfer_id) {
+            return Err(EngineError::TransferCancelled);
+        }
+
+        // Idempotent: re-accepting an in-flight transfer must not rotate the
+        // upload token (that would 401 the sender mid-transfer).
+        {
+            let approved = self.approved_tokens.read().await;
+            if let Some(token) = approved.get(transfer_id) {
+                return Ok(token.clone());
+            }
+        }
+
         // Check if transfer exists
         let pending = self.pending_transfers.read().await;
         if !pending.contains_key(transfer_id) {
@@ -207,6 +225,19 @@ impl ServerState {
 
     /// Reject a pending transfer
     pub async fn reject_transfer(&self, transfer_id: &str) -> EngineResult<()> {
+        if self.cancelled_transfers.read().await.contains(transfer_id) {
+            return Err(EngineError::TransferCancelled);
+        }
+
+        // Rejecting an already-accepted transfer would yank the token out from
+        // under an in-progress upload without emitting TransferFailed. Callers
+        // must use cancel_transfer() for that.
+        if self.approved_tokens.read().await.contains_key(transfer_id) {
+            return Err(EngineError::InvalidConfig(
+                "Transfer already accepted; use cancel_transfer to stop it".to_string(),
+            ));
+        }
+
         // Check if transfer exists
         let pending = self.pending_transfers.read().await;
         if !pending.contains_key(transfer_id) {
@@ -214,12 +245,14 @@ impl ServerState {
         }
         drop(pending);
 
-        // Mark as rejected
+        // Mark as rejected and drop the pending record so it no longer appears
+        // in get_pending_transfers() (status polling still sees rejected_transfers).
         self.rejected_transfers
             .write()
             .await
             .insert(transfer_id.to_string(), "Rejected by user".to_string());
         self.approved_tokens.write().await.remove(transfer_id);
+        self.pending_transfers.write().await.remove(transfer_id);
 
         Ok(())
     }
@@ -283,12 +316,17 @@ impl ServerState {
         self.cancelled_transfers.read().await.contains(transfer_id)
     }
 
-    /// Get all pending transfers
+    /// Get transfers that are still awaiting user approval.
+    ///
+    /// Accepted (in-progress) and rejected transfers are excluded so UIs do
+    /// not keep showing them in the pending section.
     pub async fn get_pending_transfers(&self) -> Vec<PendingTransfer> {
-        self.pending_transfers
-            .read()
-            .await
+        let pending = self.pending_transfers.read().await;
+        let approved = self.approved_tokens.read().await;
+        let rejected = self.rejected_transfers.read().await;
+        pending
             .values()
+            .filter(|t| !approved.contains_key(&t.id) && !rejected.contains_key(&t.id))
             .cloned()
             .collect()
     }
@@ -347,20 +385,36 @@ pub fn create_router(state: Arc<ServerState>) -> Router {
         .route("/chunk", post(chunk_upload_handler))
         // SSE endpoint for transfer progress
         .route("/events", get(events_handler))
+        .layer(
+            // Permissive CORS so browser UIs can call /info, /events, and
+            // the transfer endpoints. Credentials are intentionally omitted:
+            // `*` + credentials is invalid and would hide responses.
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                .allow_headers(Any),
+        )
         .with_state(state)
 }
 
 fn sanitize_file_name(name: &str, fallback: &str) -> String {
-    let trimmed = name.trim();
+    let stripped: String = name.chars().filter(|c| !c.is_control()).collect();
+    let trimmed = stripped.trim();
     let file_name = Path::new(trimmed)
         .file_name()
         .and_then(|n| n.to_str())
         .map(|n| n.trim())
         .filter(|n| !n.is_empty() && *n != "." && *n != "..");
 
-    file_name
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| fallback.to_string())
+    file_name.map(|n| n.to_string()).unwrap_or_else(|| {
+        let fb: String = fallback.chars().filter(|c| !c.is_control()).collect();
+        let fb = fb.trim();
+        if fb.is_empty() || fb == "." || fb == ".." {
+            "file".to_string()
+        } else {
+            fb.to_string()
+        }
+    })
 }
 
 fn split_file_name(name: &str) -> (&str, &str) {
@@ -372,22 +426,85 @@ fn split_file_name(name: &str) -> (&str, &str) {
     (name, "")
 }
 
-/// Sanitize a relative path to prevent directory traversal attacks
+/// Sanitize a relative path to prevent directory traversal attacks.
+///
+/// Both `/` and `\` are treated as separators so a Windows sender talking to
+/// a Unix receiver still recreates the tree instead of writing a single
+/// oddly-named file. `..`, `.`, empty, and drive-letter components are dropped.
 fn sanitize_relative_path(path: &str) -> PathBuf {
     let mut result = PathBuf::new();
 
-    for component in Path::new(path).components() {
-        // Only allow normal path components (no . or ..)
-        // Skip root, parent (..), current (.), and prefix components
-        if let std::path::Component::Normal(name) = component {
-            if let Some(name_str) = name.to_str() {
-                let safe_name = sanitize_file_name(name_str, "file");
-                result.push(safe_name);
-            }
+    for component in path.split(['/', '\\']) {
+        if component.is_empty() || component == "." || component == ".." {
+            continue;
+        }
+        // Skip Windows drive prefixes ("C:")
+        let bytes = component.as_bytes();
+        if bytes.len() == 2 && bytes[1] == b':' {
+            continue;
+        }
+        let safe_name = sanitize_file_name(component, "file");
+        if safe_name != "." && safe_name != ".." && !safe_name.is_empty() {
+            result.push(safe_name);
         }
     }
 
     result
+}
+
+/// Directory to write into and the unique-file base name, always under `download_dir`.
+///
+/// A relative path that sanitizes to empty (e.g. `../../../`) used to join to
+/// `download_dir` itself; using `.parent()` then wrote *outside* the download
+/// folder. That both escaped the sandbox and made files "disappear" from the
+/// expected download section.
+fn receive_target(
+    download_dir: &Path,
+    file_info: &crate::protocol::TransferFile,
+) -> (PathBuf, String) {
+    let fallback_name = sanitize_file_name(&file_info.name, &file_info.id);
+
+    if let Some(ref relative_path) = file_info.relative_path {
+        let sanitized = sanitize_relative_path(relative_path);
+        if !sanitized.as_os_str().is_empty() {
+            let target = download_dir.join(&sanitized);
+            if target.starts_with(download_dir) && target != download_dir {
+                if let Some(parent) = target.parent() {
+                    if parent.starts_with(download_dir) {
+                        let base_name = target
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| fallback_name.clone());
+                        return (parent.to_path_buf(), base_name);
+                    }
+                }
+            }
+        }
+    }
+
+    (download_dir.to_path_buf(), fallback_name)
+}
+
+/// Normalize a peer IP for trusted-host matching.
+/// Dual-stack listeners report IPv4 clients as `::ffff:a.b.c.d`.
+fn normalize_ip(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => v6.to_string(),
+        },
+        other => other.to_string(),
+    }
+}
+
+fn normalize_trusted_host(host: &str) -> String {
+    let host = host.trim();
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        normalize_ip(ip)
+    } else {
+        host.to_string()
+    }
 }
 
 async fn open_unique_file(
@@ -439,6 +556,7 @@ async fn info_handler(State(state): State<Arc<ServerState>>) -> impl IntoRespons
 
     Json(serde_json::json!({
         "name": config.device_name,
+        "deviceName": config.device_name,
         "version": env!("CARGO_PKG_VERSION"),
         "app": "gosh-lan-transfer"
     }))
@@ -450,6 +568,18 @@ async fn transfer_request_handler(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(request): Json<TransferRequest>,
 ) -> impl IntoResponse {
+    if request.files.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(TransferResponse {
+                accepted: false,
+                message: Some("No files in transfer request".to_string()),
+                token: None,
+            }),
+        )
+            .into_response();
+    }
+
     let computed_total: u64 = request.files.iter().map(|f| f.size).sum();
 
     if computed_total != request.total_size {
@@ -469,13 +599,7 @@ async fn transfer_request_handler(
 
     // Normalize IPv4-mapped IPv6 addresses (the dual-stack listener reports
     // IPv4 clients as ::ffff:a.b.c.d, which would never match trusted hosts)
-    let source_ip = match addr.ip() {
-        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => v4.to_string(),
-            None => v6.to_string(),
-        },
-        ip => ip.to_string(),
-    };
+    let source_ip = normalize_ip(addr.ip());
 
     // Create a pending transfer record
     let pending = PendingTransfer {
@@ -487,9 +611,13 @@ async fn transfer_request_handler(
         received_at: chrono::Utc::now(),
     };
 
-    // Check if sender is in trusted hosts
+    // Check if sender is in trusted hosts (normalize entries so ::ffff:x.x.x.x
+    // in the config also matches a plain IPv4 source).
     let config = state.config.read().await;
-    let is_trusted = config.trusted_hosts.iter().any(|host| host == &source_ip);
+    let is_trusted = config
+        .trusted_hosts
+        .iter()
+        .any(|host| normalize_trusted_host(host) == source_ip || host == &source_ip);
 
     state
         .pending_transfers
@@ -521,7 +649,8 @@ async fn transfer_request_handler(
             accepted: true,
             message: Some("Auto-accepted from trusted host".to_string()),
             token: Some(token),
-        });
+        })
+        .into_response();
     }
 
     // Notify about the incoming request via event handler
@@ -533,6 +662,7 @@ async fn transfer_request_handler(
         message: Some("Awaiting user approval".to_string()),
         token: None,
     })
+    .into_response()
 }
 
 /// Check transfer approval status
@@ -637,54 +767,25 @@ async fn chunk_upload_handler(
         }
     };
 
-    // Determine the target path based on relative_path
-    let (file_path, mut file) = if let Some(ref relative_path) = file_info.relative_path {
-        // Sanitize the relative path to prevent directory traversal
-        let sanitized_relative = sanitize_relative_path(relative_path);
-        let target_path = download_dir.join(&sanitized_relative);
+    // Resolve a destination that is always inside download_dir, even when the
+    // relative path is empty or made entirely of `..` components.
+    let (parent_dir, base_name) = receive_target(&download_dir, &file_info);
+    if let Err(e) = tokio::fs::create_dir_all(&parent_dir).await {
+        tracing::error!("Failed to create directory structure: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to create directories: {}", e)})),
+        );
+    }
 
-        // Create parent directories if needed
-        if let Some(parent) = target_path.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                tracing::error!("Failed to create directory structure: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(
-                        serde_json::json!({"error": format!("Failed to create directories: {}", e)}),
-                    ),
-                );
-            }
-        }
-
-        // Open or create with unique name within the subdirectory
-        let base_name = target_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(&file_info.id);
-        let parent_dir = target_path.parent().unwrap_or(&download_dir);
-
-        match open_unique_file(parent_dir, base_name).await {
-            Ok(result) => result,
-            Err(e) => {
-                tracing::error!("Failed to create file: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("Failed to create file: {}", e)})),
-                );
-            }
-        }
-    } else {
-        // No relative path, save directly in download_dir
-        let safe_name = sanitize_file_name(&file_info.name, &file_info.id);
-        match open_unique_file(&download_dir, &safe_name).await {
-            Ok(result) => result,
-            Err(e) => {
-                tracing::error!("Failed to create file: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("Failed to create file: {}", e)})),
-                );
-            }
+    let (file_path, mut file) = match open_unique_file(&parent_dir, &base_name).await {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::error!("Failed to create file: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to create file: {}", e)})),
+            );
         }
     };
 
@@ -832,11 +933,42 @@ async fn chunk_upload_handler(
         bytes_received
     );
 
+    // Always emit a progress event after each successful file so zero-byte
+    // files (which never enter the stream loop) still update the UI.
+    {
+        let cumulative_bytes = *state
+            .transfer_bytes
+            .read()
+            .await
+            .get(&params.transfer_id)
+            .unwrap_or(&bytes_received);
+        let speed_bps = {
+            let start_times = state.transfer_start_times.read().await;
+            if let Some(start_time) = start_times.get(&params.transfer_id) {
+                let elapsed_secs = start_time.elapsed().as_secs_f64();
+                if elapsed_secs > 0.0 {
+                    (cumulative_bytes as f64 / elapsed_secs) as u64
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        };
+        state.emit_event(EngineEvent::TransferProgress(TransferProgress {
+            transfer_id: params.transfer_id.clone(),
+            current_file: Some(stored_name.clone()),
+            bytes_transferred: cumulative_bytes,
+            total_bytes: transfer.total_size,
+            speed_bps,
+        }));
+    }
+
     // Track received file and check if transfer is complete
     let transfer_id = params.transfer_id.clone();
     let file_id = params.file_id.clone();
+    let expected_count = transfer.files.len();
 
-    // Add file to received set
     {
         let mut received = state.received_files.write().await;
         received
@@ -845,35 +977,40 @@ async fn chunk_upload_handler(
             .insert(file_id);
     }
 
-    // Check if all files have been received
-    let pending = state.pending_transfers.read().await;
-    if let Some(transfer) = pending.get(&transfer_id) {
-        let expected_count = transfer.files.len();
-        let received = state.received_files.read().await;
-        let received_count = received.get(&transfer_id).map(|s| s.len()).unwrap_or(0);
+    // Atomically take the pending record so concurrent last-file uploads
+    // cannot emit TransferComplete twice.
+    let received_count = state
+        .received_files
+        .read()
+        .await
+        .get(&transfer_id)
+        .map(|s| s.len())
+        .unwrap_or(0);
 
-        if received_count >= expected_count {
+    if received_count >= expected_count {
+        let transfer_clone = {
+            let mut pending = state.pending_transfers.write().await;
+            pending.remove(&transfer_id)
+        };
+
+        if let Some(transfer_clone) = transfer_clone {
             tracing::info!(
                 "Transfer {} complete: all {} files received",
                 transfer_id,
                 expected_count
             );
 
-            // Record to history before cleanup (clone transfer info)
-            let transfer_clone = transfer.clone();
             let total_bytes = *state
                 .transfer_bytes
                 .read()
                 .await
                 .get(&transfer_id)
-                .unwrap_or(&transfer.total_size);
+                .unwrap_or(&transfer_clone.total_size);
 
-            // Emit completion event
             state.emit_event(EngineEvent::TransferComplete {
                 transfer_id: transfer_id.clone(),
             });
 
-            // Record to history
             state.record_receive_history(
                 &transfer_clone,
                 TransferStatus::Completed,
@@ -881,12 +1018,6 @@ async fn chunk_upload_handler(
                 None,
             );
 
-            // Clean up transfer state (drop the read lock first)
-            drop(pending);
-            drop(received);
-
-            // Remove from tracking maps
-            state.pending_transfers.write().await.remove(&transfer_id);
             state.approved_tokens.write().await.remove(&transfer_id);
             state.received_files.write().await.remove(&transfer_id);
             state.transfer_bytes.write().await.remove(&transfer_id);
@@ -911,26 +1042,24 @@ async fn chunk_upload_handler(
 /// SSE endpoint for real-time transfer events
 async fn events_handler(
     State(state): State<Arc<ServerState>>,
-) -> Sse<
-    impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
-> {
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
     let rx = state.internal_event_tx.subscribe();
 
-    let stream = BroadcastStream::new(rx).map(|result: Result<InternalEvent, _>| {
-        let event: InternalEvent = match result {
-            Ok(event) => event,
-            Err(_) => {
-                return Ok::<_, std::convert::Infallible>(
-                    axum::response::sse::Event::default().data("heartbeat"),
-                )
+    let stream = BroadcastStream::new(rx).map(|result| {
+        match result {
+            Ok(event) => {
+                let data = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+                Ok(Event::default().data(data))
             }
-        };
-
-        let data = serde_json::to_string(&event).unwrap_or_default();
-        Ok(axum::response::sse::Event::default().data(data))
+            Err(_) => {
+                // Lagged/closed: emit an SSE *comment* so JSON `onmessage`
+                // handlers are not fed the literal string "heartbeat".
+                Ok(Event::default().comment("lagged"))
+            }
+        }
     });
 
-    Sse::new(stream)
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 /// Start the HTTP server and return a handle for controlling it
@@ -978,4 +1107,94 @@ pub async fn start_server(state: Arc<ServerState>, port: u16) -> EngineResult<Se
         .on_event(EngineEvent::ServerStarted { port });
 
     Ok(ServerHandle { shutdown_tx })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::TransferFile;
+
+    fn sample_file(name: &str, relative: Option<&str>) -> TransferFile {
+        TransferFile {
+            id: "file-id".to_string(),
+            name: name.to_string(),
+            size: 1,
+            mime_type: None,
+            relative_path: relative.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn receive_target_keeps_files_inside_download_dir() {
+        let download = PathBuf::from("/tmp/downloads");
+        let (parent, base) = receive_target(
+            &download,
+            &sample_file("secret.txt", Some("../../../secret.txt")),
+        );
+        assert!(parent.starts_with(&download), "parent={:?}", parent);
+        assert_eq!(parent, download);
+        assert_eq!(base, "secret.txt");
+    }
+
+    #[test]
+    fn receive_target_empty_relative_does_not_use_download_dir_parent() {
+        let download = PathBuf::from("/tmp/downloads");
+        let (parent, base) = receive_target(&download, &sample_file("notes.txt", Some("..")));
+        assert_eq!(parent, download);
+        assert_eq!(base, "notes.txt");
+        assert_ne!(parent, PathBuf::from("/tmp"));
+    }
+
+    #[test]
+    fn receive_target_preserves_nested_directory() {
+        let download = PathBuf::from("/tmp/downloads");
+        let (parent, base) =
+            receive_target(&download, &sample_file("a.txt", Some("sub/dir/a.txt")));
+        assert_eq!(parent, download.join("sub").join("dir"));
+        assert_eq!(base, "a.txt");
+    }
+
+    #[test]
+    fn receive_target_normalizes_backslashes() {
+        let download = PathBuf::from("/tmp/downloads");
+        let (parent, base) =
+            receive_target(&download, &sample_file("a.txt", Some("sub\\dir\\a.txt")));
+        assert_eq!(parent, download.join("sub").join("dir"));
+        assert_eq!(base, "a.txt");
+    }
+
+    #[test]
+    fn sanitize_file_name_strips_control_characters() {
+        let name = sanitize_file_name("ok\nfile\x07.txt", "fallback");
+        assert!(!name.chars().any(|c| c.is_control()));
+        assert!(name.contains("file"));
+    }
+
+    #[test]
+    fn sse_progress_event_uses_transfer_progress_type() {
+        let event = InternalEvent::TransferProgress {
+            progress: TransferProgress {
+                transfer_id: "t".to_string(),
+                current_file: Some("a.txt".to_string()),
+                bytes_transferred: 10,
+                total_bytes: 100,
+                speed_bps: 1,
+            },
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "transferProgress");
+        assert_eq!(json["progress"]["bytesTransferred"], 10);
+        assert_eq!(json["progress"]["totalBytes"], 100);
+    }
+
+    #[test]
+    fn normalize_mapped_ipv6() {
+        let mapped: std::net::IpAddr = "::ffff:192.168.1.10".parse().unwrap();
+        assert_eq!(normalize_ip(mapped), "192.168.1.10");
+        assert_eq!(
+            normalize_trusted_host("::ffff:192.168.1.10"),
+            "192.168.1.10"
+        );
+        assert_eq!(normalize_trusted_host("127.0.0.1"), "127.0.0.1");
+    }
 }

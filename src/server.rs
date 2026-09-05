@@ -7,7 +7,7 @@
 use axum::{
     body::Body,
     extract::{ConnectInfo, Query, State},
-    http::{Method, StatusCode},
+    http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse,
@@ -28,10 +28,9 @@ use std::{
 use tokio::{
     fs::{File, OpenOptions},
     io::AsyncWriteExt,
-    sync::{broadcast, oneshot, RwLock},
+    sync::{broadcast, oneshot, Mutex, RwLock},
 };
 use tokio_stream::wrappers::BroadcastStream;
-use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
 use crate::config::EngineConfig;
@@ -46,6 +45,11 @@ use crate::types::{TransferDirection, TransferRecord, TransferStatus};
 
 /// Server state shared across handlers
 pub struct ServerState {
+    // Serialize decisions and request registration, and uploads within each transfer.
+    decisions: Mutex<()>,
+    upload_locks: std::sync::Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
+    completed: RwLock<HashSet<String>>,
+    last_activity: Mutex<HashMap<String, std::time::Instant>>,
     /// Engine configuration
     pub config: RwLock<EngineConfig>,
     /// Pending transfers awaiting user approval
@@ -103,6 +107,10 @@ impl ServerState {
         let (internal_event_tx, _) = broadcast::channel(100);
 
         Self {
+            decisions: Mutex::new(()),
+            upload_locks: std::sync::Mutex::new(HashMap::new()),
+            completed: RwLock::new(HashSet::new()),
+            last_activity: Mutex::new(HashMap::new()),
             config: RwLock::new(config),
             pending_transfers: RwLock::new(HashMap::new()),
             approved_tokens: RwLock::new(HashMap::new()),
@@ -126,6 +134,10 @@ impl ServerState {
         let (internal_event_tx, _) = broadcast::channel(100);
 
         Self {
+            decisions: Mutex::new(()),
+            upload_locks: std::sync::Mutex::new(HashMap::new()),
+            completed: RwLock::new(HashSet::new()),
+            last_activity: Mutex::new(HashMap::new()),
             config: RwLock::new(config),
             pending_transfers: RwLock::new(HashMap::new()),
             approved_tokens: RwLock::new(HashMap::new()),
@@ -192,6 +204,10 @@ impl ServerState {
 
     /// Accept a pending transfer
     pub async fn accept_transfer(&self, transfer_id: &str) -> EngineResult<String> {
+        let _decision = self.decisions.lock().await;
+        if self.completed.read().await.contains(transfer_id) {
+            return Err(EngineError::TransferNotFound(transfer_id.to_string()));
+        }
         if self.cancelled_transfers.read().await.contains(transfer_id) {
             return Err(EngineError::TransferCancelled);
         }
@@ -225,6 +241,10 @@ impl ServerState {
 
     /// Reject a pending transfer
     pub async fn reject_transfer(&self, transfer_id: &str) -> EngineResult<()> {
+        let _decision = self.decisions.lock().await;
+        if self.completed.read().await.contains(transfer_id) {
+            return Err(EngineError::TransferNotFound(transfer_id.to_string()));
+        }
         if self.cancelled_transfers.read().await.contains(transfer_id) {
             return Err(EngineError::TransferCancelled);
         }
@@ -261,6 +281,10 @@ impl ServerState {
     ///
     /// This will cause subsequent chunk uploads to be rejected.
     pub async fn cancel_transfer(&self, transfer_id: &str) -> EngineResult<()> {
+        let _decision = self.decisions.lock().await;
+        if self.completed.read().await.contains(transfer_id) {
+            return Err(EngineError::TransferNotFound(transfer_id.to_string()));
+        }
         // Check if transfer exists (either pending or approved) and get transfer info for history
         let pending = self.pending_transfers.read().await;
         let approved = self.approved_tokens.read().await;
@@ -348,9 +372,24 @@ impl ServerState {
 /// Handle for controlling a running server
 pub struct ServerHandle {
     shutdown_tx: oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+    pub port: u16,
 }
 
 impl ServerHandle {
+    /// Stop accepting connections and wait for in-flight requests for up to two seconds.
+    pub async fn shutdown_and_wait(self) {
+        let _ = self.shutdown_tx.send(());
+        let mut task = self.task;
+        if tokio::time::timeout(std::time::Duration::from_secs(2), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
     /// Shutdown the server gracefully
     pub fn shutdown(self) {
         let _ = self.shutdown_tx.send(());
@@ -385,36 +424,64 @@ pub fn create_router(state: Arc<ServerState>) -> Router {
         .route("/chunk", post(chunk_upload_handler))
         // SSE endpoint for transfer progress
         .route("/events", get(events_handler))
-        .layer(
-            // Permissive CORS so browser UIs can call /info, /events, and
-            // the transfer endpoints. Credentials are intentionally omitted:
-            // `*` + credentials is invalid and would hide responses.
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-                .allow_headers(Any),
-        )
         .with_state(state)
 }
 
 fn sanitize_file_name(name: &str, fallback: &str) -> String {
-    let stripped: String = name.chars().filter(|c| !c.is_control()).collect();
-    let trimmed = stripped.trim();
-    let file_name = Path::new(trimmed)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|n| n.trim())
-        .filter(|n| !n.is_empty() && *n != "." && *n != "..");
-
-    file_name.map(|n| n.to_string()).unwrap_or_else(|| {
-        let fb: String = fallback.chars().filter(|c| !c.is_control()).collect();
-        let fb = fb.trim();
-        if fb.is_empty() || fb == "." || fb == ".." {
-            "file".to_string()
-        } else {
-            fb.to_string()
+    fn clean(value: &str) -> Option<String> {
+        let leaf = value.rsplit(['/', '\\']).next().unwrap_or("");
+        let stripped: String = leaf
+            .chars()
+            .filter(|c| !c.is_control())
+            .map(|c| if "<>:\"|?*".contains(c) { '_' } else { c })
+            .collect();
+        let trimmed = stripped.trim().trim_end_matches(['.', ' ']);
+        if trimmed.is_empty() {
+            return None;
         }
-    })
+        let stem = trimmed.split('.').next().unwrap_or("").to_ascii_uppercase();
+        if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || (stem.len() == 4
+                && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+        {
+            Some(format!("_{}", trimmed))
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+    clean(name)
+        .or_else(|| clean(fallback))
+        .unwrap_or_else(|| "file".into())
+}
+
+// Reject existing symlink/junction paths before traversing them. The download root
+// must be application-owned; concurrent local filesystem mutation is outside the threat model.
+async fn create_receive_parent(root: &Path, parent: &Path) -> std::io::Result<()> {
+    let canonical_root = tokio::fs::canonicalize(root).await?;
+    let relative = parent.strip_prefix(root).map_err(std::io::Error::other)?;
+    let mut current = canonical_root.clone();
+    for part in relative.components() {
+        current.push(part);
+        match tokio::fs::create_dir(&current).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        let metadata = tokio::fs::symlink_metadata(&current).await?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || !tokio::fs::canonicalize(&current)
+                .await?
+                .starts_with(&canonical_root)
+        {
+            return Err(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                "Unsafe receive directory",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn split_file_name(name: &str) -> (&str, &str) {
@@ -566,8 +633,56 @@ async fn info_handler(State(state): State<Arc<ServerState>>) -> impl IntoRespons
 async fn transfer_request_handler(
     State(state): State<Arc<ServerState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<TransferRequest>,
 ) -> impl IntoResponse {
+    let _decision = state.decisions.lock().await;
+    // Expire idle sessions and retry receipts after one hour; never prune an active upload.
+    let expired: Vec<String> = {
+        let activity = state.last_activity.lock().await;
+        let locks = state.upload_locks.lock().unwrap_or_else(|e| e.into_inner());
+        activity
+            .iter()
+            .filter(|(id, time)| {
+                time.elapsed().as_secs() >= 3600
+                    && !locks.get(*id).is_some_and(|lock| lock.strong_count() > 0)
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    for id in expired {
+        state.pending_transfers.write().await.remove(&id);
+        state.approved_tokens.write().await.remove(&id);
+        state.rejected_transfers.write().await.remove(&id);
+        state.cancelled_transfers.write().await.remove(&id);
+        state.received_files.write().await.remove(&id);
+        state.transfer_bytes.write().await.remove(&id);
+        state.transfer_start_times.write().await.remove(&id);
+        state.completed.write().await.remove(&id);
+        state.last_activity.lock().await.remove(&id);
+    }
+    // Browser requests must not turn a trusted host into a drive-by upload service.
+    if headers.contains_key(axum::http::header::ORIGIN) {
+        return (
+            StatusCode::FORBIDDEN,
+            "Browser transfer requests are disabled",
+        )
+            .into_response();
+    }
+    let mut ids = HashSet::new();
+    if request.transfer_id.is_empty()
+        || request.transfer_id.len() > 128
+        || request
+            .files
+            .iter()
+            .any(|f| f.id.is_empty() || f.id.len() > 128 || !ids.insert(&f.id))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Invalid or duplicate transfer/file ID",
+        )
+            .into_response();
+    }
     if request.files.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -580,7 +695,13 @@ async fn transfer_request_handler(
             .into_response();
     }
 
-    let computed_total: u64 = request.files.iter().map(|f| f.size).sum();
+    let Some(computed_total) = request
+        .files
+        .iter()
+        .try_fold(0u64, |n, f| n.checked_add(f.size))
+    else {
+        return (StatusCode::BAD_REQUEST, "Transfer size overflow").into_response();
+    };
 
     if computed_total != request.total_size {
         tracing::warn!(
@@ -600,6 +721,69 @@ async fn transfer_request_handler(
     // Normalize IPv4-mapped IPv6 addresses (the dual-stack listener reports
     // IPv4 clients as ::ffff:a.b.c.d, which would never match trusted hosts)
     let source_ip = normalize_ip(addr.ip());
+
+    if state
+        .cancelled_transfers
+        .read()
+        .await
+        .contains(&request.transfer_id)
+        || state
+            .rejected_transfers
+            .read()
+            .await
+            .contains_key(&request.transfer_id)
+    {
+        return (StatusCode::CONFLICT, "Transfer ID has already been used").into_response();
+    }
+    if let Some(existing) = state
+        .pending_transfers
+        .read()
+        .await
+        .get(&request.transfer_id)
+    {
+        // Retries may repeat the exact request but must never replace approved metadata.
+        if existing.source_ip != source_ip
+            || serde_json::to_value(&existing.files).ok()
+                != serde_json::to_value(&request.files).ok()
+            || existing.sender_name != request.sender_name
+        {
+            return (
+                StatusCode::CONFLICT,
+                "Transfer ID conflicts with an existing request",
+            )
+                .into_response();
+        }
+        let token = state
+            .approved_tokens
+            .read()
+            .await
+            .get(&request.transfer_id)
+            .cloned();
+        return Json(TransferResponse {
+            accepted: token.is_some(),
+            token,
+            message: None,
+        })
+        .into_response();
+    }
+    // Bound retained sessions (including receipts used to safely retry lost responses).
+    if state.pending_transfers.read().await.len()
+        + state.rejected_transfers.read().await.len()
+        + state.cancelled_transfers.read().await.len()
+        >= 1024
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Session capacity reached; retry after idle sessions expire",
+        )
+            .into_response();
+    }
+
+    state
+        .last_activity
+        .lock()
+        .await
+        .insert(request.transfer_id.clone(), std::time::Instant::now());
 
     // Create a pending transfer record
     let pending = PendingTransfer {
@@ -669,7 +853,21 @@ async fn transfer_request_handler(
 async fn transfer_status_handler(
     State(state): State<Arc<ServerState>>,
     Query(params): Query<TransferStatusParams>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> impl IntoResponse {
+    if state
+        .pending_transfers
+        .read()
+        .await
+        .get(&params.transfer_id)
+        .is_some_and(|t| t.source_ip != normalize_ip(addr.ip()))
+    {
+        return Json(TransferApprovalStatus {
+            status: TransferDecision::NotFound,
+            token: None,
+            message: None,
+        });
+    }
     let approved = state.approved_tokens.read().await;
     if let Some(token) = approved.get(&params.transfer_id) {
         return Json(TransferApprovalStatus {
@@ -710,8 +908,18 @@ async fn transfer_status_handler(
 async fn chunk_upload_handler(
     State(state): State<Arc<ServerState>>,
     Query(params): Query<ChunkParams>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     body: Body,
 ) -> impl IntoResponse {
+    let upload_lock = {
+        let mut locks = state.upload_locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let slot = locks.entry(params.transfer_id.clone()).or_default();
+        let lock = slot.upgrade().unwrap_or_else(|| Arc::new(Mutex::new(())));
+        *slot = Arc::downgrade(&lock);
+        lock
+    };
+    let _upload = upload_lock.lock().await;
     // Check if transfer was cancelled
     if state.is_transfer_cancelled(&params.transfer_id).await {
         return (
@@ -757,6 +965,25 @@ async fn chunk_upload_handler(
     };
     drop(pending);
 
+    if transfer.source_ip != normalize_ip(addr.ip()) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Transfer belongs to another peer"})),
+        );
+    }
+    if state
+        .received_files
+        .read()
+        .await
+        .get(&params.transfer_id)
+        .is_some_and(|files| files.contains(&params.file_id))
+    {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "already_received"})),
+        );
+    }
+
     let file_info = match transfer.files.iter().find(|f| f.id == params.file_id) {
         Some(f) => f.clone(),
         None => {
@@ -767,10 +994,16 @@ async fn chunk_upload_handler(
         }
     };
 
+    state
+        .last_activity
+        .lock()
+        .await
+        .insert(params.transfer_id.clone(), std::time::Instant::now());
+
     // Resolve a destination that is always inside download_dir, even when the
     // relative path is empty or made entirely of `..` components.
     let (parent_dir, base_name) = receive_target(&download_dir, &file_info);
-    if let Err(e) = tokio::fs::create_dir_all(&parent_dir).await {
+    if let Err(e) = create_receive_parent(&download_dir, &parent_dir).await {
         tracing::error!("Failed to create directory structure: {}", e);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -808,7 +1041,32 @@ async fn chunk_upload_handler(
     let mut stream = body.into_data_stream();
     let mut last_progress_bytes: u64 = 0;
 
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let chunk = tokio::select! {
+            chunk = tokio::time::timeout(std::time::Duration::from_secs(120), stream.next()) => match chunk {
+                Ok(chunk) => chunk,
+                Err(_) => {
+                    drop(file);
+                    let _ = tokio::fs::remove_file(&file_path).await;
+                    state.rollback_file_bytes(&params.transfer_id, bytes_received).await;
+                    return (StatusCode::REQUEST_TIMEOUT, Json(serde_json::json!({"error": "Upload stalled"})));
+                }
+            },
+            _ = async {
+                loop {
+                    if state.is_transfer_cancelled(&params.transfer_id).await { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            } => {
+                drop(file);
+                let _ = tokio::fs::remove_file(&file_path).await;
+                state.rollback_file_bytes(&params.transfer_id, bytes_received).await;
+                return (StatusCode::GONE, Json(serde_json::json!({"error": "Transfer cancelled"})));
+            }
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         match chunk {
             Ok(data) => {
                 let next_size = bytes_received + data.len() as u64;
@@ -910,6 +1168,8 @@ async fn chunk_upload_handler(
         );
     }
 
+    drop(file);
+
     if bytes_received != file_info.size {
         tracing::warn!(
             "Size mismatch for {}: expected {}, received {}",
@@ -924,6 +1184,18 @@ async fn chunk_upload_handler(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "Incomplete file received"})),
+        );
+    }
+
+    let _decision = state.decisions.lock().await;
+    if state.is_transfer_cancelled(&params.transfer_id).await {
+        let _ = tokio::fs::remove_file(&file_path).await;
+        state
+            .rollback_file_bytes(&params.transfer_id, bytes_received)
+            .await;
+        return (
+            StatusCode::GONE,
+            Json(serde_json::json!({"error": "Transfer cancelled"})),
         );
     }
 
@@ -989,8 +1261,12 @@ async fn chunk_upload_handler(
 
     if received_count >= expected_count {
         let transfer_clone = {
-            let mut pending = state.pending_transfers.write().await;
-            pending.remove(&transfer_id)
+            let pending = state.pending_transfers.read().await;
+            if state.completed.write().await.insert(transfer_id.clone()) {
+                pending.get(&transfer_id).cloned()
+            } else {
+                None
+            }
         };
 
         if let Some(transfer_clone) = transfer_clone {
@@ -1018,8 +1294,7 @@ async fn chunk_upload_handler(
                 None,
             );
 
-            state.approved_tokens.write().await.remove(&transfer_id);
-            state.received_files.write().await.remove(&transfer_id);
+            // Retain the token and file receipts so a lost final HTTP response is retryable.
             state.transfer_bytes.write().await.remove(&transfer_id);
             state
                 .transfer_start_times
@@ -1073,23 +1348,31 @@ pub async fn start_server(state: Arc<ServerState>, port: u16) -> EngineResult<Se
     let addr_v6 = SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
     let addr_v4 = SocketAddr::from(([0, 0, 0, 0], port));
 
-    let listener = match tokio::net::TcpListener::bind(addr_v6).await {
-        Ok(l) => {
-            tracing::info!("Bound to IPv6 wildcard [::]:{}  (dual-stack)", port);
-            l
+    let bind = |addr: SocketAddr| -> std::io::Result<tokio::net::TcpListener> {
+        let socket = socket2::Socket::new(
+            socket2::Domain::for_address(addr),
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+        if addr.is_ipv6() {
+            socket.set_only_v6(false)?;
         }
-        Err(e) => {
-            tracing::debug!("IPv6 bind failed ({}), falling back to IPv4", e);
-            tokio::net::TcpListener::bind(addr_v4).await.map_err(|e| {
-                EngineError::Network(format!("Failed to bind to port {}: {}", port, e))
-            })?
-        }
+        #[cfg(unix)]
+        socket.set_reuse_address(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&addr.into())?;
+        socket.listen(1024)?;
+        tokio::net::TcpListener::from_std(socket.into())
     };
+    let listener = bind(addr_v6)
+        .or_else(|_| bind(addr_v4))
+        .map_err(|e| EngineError::Network(format!("Failed to bind port {port}: {e}")))?;
+    let port = listener.local_addr()?.port();
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     // Spawn the server in the background
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -1106,7 +1389,11 @@ pub async fn start_server(state: Arc<ServerState>, port: u16) -> EngineResult<Se
         .event_handler
         .on_event(EngineEvent::ServerStarted { port });
 
-    Ok(ServerHandle { shutdown_tx })
+    Ok(ServerHandle {
+        shutdown_tx,
+        task,
+        port,
+    })
 }
 
 #[cfg(test)]
@@ -1122,6 +1409,16 @@ mod tests {
             mime_type: None,
             relative_path: relative.map(|s| s.to_string()),
         }
+    }
+
+    #[test]
+    fn fallback_ids_and_windows_names_are_safe() {
+        let name = sanitize_file_name("..", "../../escape.txt");
+        assert_eq!(name, "escape.txt");
+        assert_eq!(sanitize_file_name("..", ".."), "file");
+        assert_eq!(sanitize_file_name("C:\\tmp\\a.txt", "f"), "a.txt");
+        assert_eq!(sanitize_file_name("file:stream", "f"), "file_stream");
+        assert_eq!(sanitize_file_name("CON.txt", "f"), "_CON.txt");
     }
 
     #[test]

@@ -433,8 +433,8 @@ async fn info_cors_and_sse_event_type() {
         info.headers()
             .get("access-control-allow-origin")
             .and_then(|v| v.to_str().ok()),
-        Some("*"),
-        "browser UIs need CORS on /info or the device-name section stays blank"
+        None,
+        "untrusted browser origins must not get CORS access"
     );
     let body: serde_json::Value = info.json().await.unwrap();
     assert_eq!(body["name"], "CorsBox");
@@ -454,7 +454,7 @@ async fn info_cors_and_sse_event_type() {
         .await
         .unwrap();
     assert!(
-        preflight.status().is_success() || preflight.status() == reqwest::StatusCode::NO_CONTENT,
+        preflight.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED,
         "unexpected preflight status {}",
         preflight.status()
     );
@@ -748,10 +748,17 @@ async fn network_utilities_and_empty_http_transfer_rejected() {
     assert!(resolved.success);
     assert!(!resolved.ips.is_empty());
     let ifaces = GoshTransferEngine::get_network_interfaces();
-    assert!(
-        ifaces.iter().any(|i| i.ip == "127.0.0.1" || i.is_loopback),
-        "expected a loopback interface, got {ifaces:?}"
-    );
+    if local_ip_address::list_afinet_netifas().is_ok() {
+        assert!(
+            ifaces.iter().any(|i| i.ip == "127.0.0.1" || i.is_loopback),
+            "expected a loopback interface, got {ifaces:?}"
+        );
+    } else {
+        assert!(
+            ifaces.is_empty(),
+            "restricted enumeration must return an empty list"
+        );
+    }
 
     let http = reqwest::Client::new();
     let resp = http
@@ -812,8 +819,9 @@ async fn bandwidth_limit_still_delivers_complete_file() {
     receiver.stop_server().await.unwrap();
 }
 
+#[cfg(unix)]
 #[tokio::test]
-async fn directory_transfer_includes_symlink_files() {
+async fn directory_transfer_skips_symlink_files() {
     let port = find_available_port().await;
     let download_dir = tempfile::tempdir().unwrap();
     let receiver_config = EngineConfig::builder()
@@ -844,10 +852,7 @@ async fn directory_transfer_includes_symlink_files() {
         std::fs::read(download_dir.path().join("real.txt")).unwrap(),
         b"linked-content"
     );
-    assert_eq!(
-        std::fs::read(download_dir.path().join("alias.txt")).unwrap(),
-        b"linked-content"
-    );
+    assert!(!download_dir.path().join("alias.txt").exists());
     receiver.stop_server().await.unwrap();
 }
 

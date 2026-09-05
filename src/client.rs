@@ -83,6 +83,7 @@ pub struct TransferClient {
 }
 
 /// Parameters for sending a single file
+#[derive(Clone)]
 struct SendFileParams<'a> {
     address: &'a str,
     port: u16,
@@ -105,6 +106,8 @@ impl TransferClient {
     /// Create a new transfer client with config
     pub fn new_with_config(event_handler: Arc<dyn EventHandler>, config: &EngineConfig) -> Self {
         let http_client = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             // No global timeout - large file transfers can take a long time
             // Use read_timeout to detect stalled connections instead
             .read_timeout(Duration::from_secs(60))
@@ -138,6 +141,8 @@ impl TransferClient {
         config: &EngineConfig,
     ) -> Self {
         let http_client = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .read_timeout(Duration::from_secs(60))
             .connect_timeout(Duration::from_secs(30))
             .build()
@@ -269,6 +274,7 @@ impl TransferClient {
             .map_err(|e| EngineError::Network(format!("Failed to get peer info: {}", e)))?;
 
         response
+            .error_for_status()?
             .json()
             .await
             .map_err(|e| EngineError::Serialization(format!("Failed to parse peer info: {}", e)))
@@ -315,7 +321,10 @@ impl TransferClient {
                                 max_attempts: self.max_retries,
                                 error: error.to_string(),
                             });
-                            let delay = self.retry_delay_ms * 2u64.pow(attempt);
+                            let delay = self
+                                .retry_delay_ms
+                                .saturating_mul(2u64.saturating_pow(attempt))
+                                .min(60_000);
                             sleep(Duration::from_millis(delay)).await;
                             last_error = Some(error);
                             continue;
@@ -352,7 +361,10 @@ impl TransferClient {
                     });
 
                     // Exponential backoff
-                    let delay = self.retry_delay_ms * 2u64.pow(attempt);
+                    let delay = self
+                        .retry_delay_ms
+                        .saturating_mul(2u64.saturating_pow(attempt))
+                        .min(60_000);
                     sleep(Duration::from_millis(delay)).await;
 
                     last_error = Some(error);
@@ -410,6 +422,32 @@ impl TransferClient {
         }
     }
 
+    /// Retry complete file uploads; the receiver makes repeated file IDs idempotent.
+    async fn send_file_with_retry(&self, params: SendFileParams<'_>) -> EngineResult<()> {
+        let baseline = params.bytes_sent_so_far.load(Ordering::SeqCst);
+        for attempt in 0..=self.max_retries {
+            params.bytes_sent_so_far.store(baseline, Ordering::SeqCst);
+            match self.send_file(params.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(error) if Self::is_transient_error(&error) && attempt < self.max_retries => {
+                    self.event_handler.on_event(EngineEvent::TransferRetry {
+                        transfer_id: params.transfer_id.into(),
+                        attempt: attempt + 1,
+                        max_attempts: self.max_retries,
+                        error: error.to_string(),
+                    });
+                    let delay = self
+                        .retry_delay_ms
+                        .saturating_mul(2u64.saturating_pow(attempt))
+                        .min(60_000);
+                    sleep(Duration::from_millis(delay)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!()
+    }
+
     /// Send a file to a peer (after transfer is accepted)
     async fn send_file(&self, params: SendFileParams<'_>) -> EngineResult<()> {
         let url = http_url(
@@ -420,6 +458,8 @@ impl TransferClient {
                 params.transfer_id, params.file_id, params.token
             ),
         );
+
+        let baseline = params.bytes_sent_so_far.load(Ordering::SeqCst);
 
         // Open and read the file
         let file = File::open(params.file_path)
@@ -521,11 +561,22 @@ impl TransferClient {
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
-            return Err(EngineError::Network(format!(
-                "Server returned error ({}): {}",
-                status, error_text
-            )));
+            if status == reqwest::StatusCode::GONE {
+                return Err(EngineError::TransferCancelled);
+            }
+            let message = format!("Server returned error ({status}): {error_text}");
+            return Err(
+                if status.is_server_error() || status == reqwest::StatusCode::REQUEST_TIMEOUT {
+                    EngineError::Network(message)
+                } else {
+                    EngineError::InvalidConfig(message)
+                },
+            );
         }
+
+        params
+            .bytes_sent_so_far
+            .store(baseline + file_size, Ordering::SeqCst);
 
         // Send final progress update for this file
         let final_bytes = params.bytes_sent_so_far.load(Ordering::SeqCst);
@@ -712,7 +763,7 @@ impl TransferClient {
         // Send each file
         for (file, path) in files.iter().zip(file_paths.iter()) {
             if let Err(e) = self
-                .send_file(SendFileParams {
+                .send_file_with_retry(SendFileParams {
                     address,
                     port,
                     transfer_id: &transfer_id,
@@ -943,7 +994,7 @@ impl TransferClient {
         // Send each file
         for (file, path) in files.iter().zip(file_paths.iter()) {
             if let Err(e) = self
-                .send_file(SendFileParams {
+                .send_file_with_retry(SendFileParams {
                     address,
                     port,
                     transfer_id: &transfer_id,
@@ -1023,13 +1074,7 @@ impl TransferClient {
                 // Do not recurse into symlink directories (avoids cycles and
                 // sending files from outside the requested tree).
                 Box::pin(Self::collect_directory_files_async(base_path, &path, files)).await?;
-            } else if file_type.is_file()
-                || (file_type.is_symlink()
-                    && tokio::fs::metadata(&path)
-                        .await
-                        .map(|m| m.is_file())
-                        .unwrap_or(false))
-            {
+            } else if file_type.is_file() {
                 // Portable wire path: always `/`, never OS-specific separators.
                 let relative = path
                     .strip_prefix(base_path)

@@ -17,7 +17,7 @@
 //!
 //! ## Example
 //!
-//! ```ignore
+//! ```no_run
 //! use gosh_lan_transfer::{GoshTransferEngine, EngineConfig, callback_handler, EngineEvent};
 //! use std::sync::Arc;
 //!
@@ -202,6 +202,11 @@ impl GoshTransferEngine {
         }
 
         let handle = server::start_server(self.server_state.clone(), self.config.port).await?;
+        self.config.port = handle.port;
+        self.server_state.update_config(self.config.clone()).await;
+        self.discovery_state
+            .update_config(self.config.clone())
+            .await;
         self.server_handle = Some(handle);
 
         Ok(())
@@ -210,7 +215,7 @@ impl GoshTransferEngine {
     /// Stop the HTTP server
     pub async fn stop_server(&mut self) -> EngineResult<()> {
         if let Some(handle) = self.server_handle.take() {
-            handle.shutdown();
+            handle.shutdown_and_wait().await;
             self.event_handler.on_event(EngineEvent::ServerStopped);
         }
         Ok(())
@@ -286,6 +291,9 @@ impl GoshTransferEngine {
         // Update config with new port
         self.config.port = new_port;
         self.server_state.update_config(self.config.clone()).await;
+        self.discovery_state
+            .update_config(self.config.clone())
+            .await;
 
         // Attempt to start on new port
         if was_running {
@@ -596,7 +604,12 @@ impl GoshTransferEngine {
     /// This updates the engine config, client config, server state config,
     /// and discovery state config. Changes to discovery settings (multicast
     /// group, port, intervals) take effect the next time discovery is started.
-    pub async fn update_config(&mut self, config: EngineConfig) {
+    /// While the server is running, its port is preserved; use `change_port` to rebind.
+    pub async fn update_config(&mut self, mut config: EngineConfig) {
+        // Port changes require binding and can fail: use change_port while running.
+        if self.is_server_running() {
+            config.port = self.config.port;
+        }
         self.client.update_config(&config);
         self.config = config.clone();
         self.server_state.update_config(config.clone()).await;

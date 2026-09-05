@@ -1188,6 +1188,11 @@ async fn chunk_upload_handler(
     }
 
     let _decision = state.decisions.lock().await;
+    state
+        .last_activity
+        .lock()
+        .await
+        .insert(params.transfer_id.clone(), std::time::Instant::now());
     if state.is_transfer_cancelled(&params.transfer_id).await {
         let _ = tokio::fs::remove_file(&file_path).await;
         state
@@ -1359,6 +1364,29 @@ pub async fn start_server(state: Arc<ServerState>, port: u16) -> EngineResult<Se
         }
         #[cfg(unix)]
         socket.set_reuse_address(true)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            use windows_sys::Win32::Networking::WinSock::{
+                setsockopt, WSAGetLastError, SOCKET_ERROR, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+            };
+            let enabled: i32 = 1;
+            // SAFETY: socket is live and enabled points to an initialized i32 for the call.
+            let result = unsafe {
+                setsockopt(
+                    socket.as_raw_socket() as _,
+                    SOL_SOCKET,
+                    SO_EXCLUSIVEADDRUSE,
+                    (&enabled as *const i32).cast(),
+                    std::mem::size_of_val(&enabled) as i32,
+                )
+            };
+            if result == SOCKET_ERROR {
+                return Err(std::io::Error::from_raw_os_error(unsafe {
+                    WSAGetLastError()
+                }));
+            }
+        }
         socket.set_nonblocking(true)?;
         socket.bind(&addr.into())?;
         socket.listen(1024)?;

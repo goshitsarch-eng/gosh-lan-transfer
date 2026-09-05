@@ -186,13 +186,9 @@ async fn existing_directory_symlink_cannot_escape_receive_root() {
 async fn status_token_and_upload_are_bound_to_original_source_ip() {
     let (mut e, _, c) = receiver().await;
     let token = register(&e, &c, &request("owner")).await;
-    let other = reqwest::Client::builder()
-        .no_proxy()
-        .local_address("127.0.0.2".parse::<std::net::IpAddr>().unwrap())
-        .build()
-        .unwrap();
+    let other = reqwest::Client::builder().no_proxy().build().unwrap();
     let status = other
-        .get(url(&e, "/transfer/status?transfer_id=owner"))
+        .get(url(&e, "/transfer/status?transfer_id=owner").replace("127.0.0.1", "[::1]"))
         .send()
         .await
         .unwrap()
@@ -202,7 +198,7 @@ async fn status_token_and_upload_are_bound_to_original_source_ip() {
     assert!(status["token"].is_null());
     assert_eq!(
         other
-            .post(chunk(&e, "owner", &token))
+            .post(chunk(&e, "owner", &token).replace("127.0.0.1", "[::1]"))
             .body("abc")
             .send()
             .await

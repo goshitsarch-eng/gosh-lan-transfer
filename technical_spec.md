@@ -1,9 +1,9 @@
 # Technical Specification
 
-> Updated for 0.4.0: the [rollout review](docs/ROLLOUT.md) defines current support
-> and limitations. See [releasing](docs/RELEASING.md) for CI and publication.
-> Browser writes are disabled; uploads retry whole files with idempotent receipts;
-> directory enumeration skips symlinks. Resume, TLS and checksums are future work.
+> Updated for 0.5.0: see [secure transfers](docs/SECURE_TRANSFERS.md) for TLS,
+> authentication, browser access, checksums, durable resume and sender cancellation.
+> The [rollout review](docs/ROLLOUT.md) defines scope and limitations, and
+> [releasing](docs/RELEASING.md) describes automatic publication.
 
 
 ## Overview
@@ -75,8 +75,8 @@ gosh-lan-transfer is a Rust library providing peer-to-peer file transfer capabil
 - **hyper** (1.x) - Low-level HTTP implementation
 - **hyper-util** (0.1) - Hyper utilities
 - **tower** (0.5) - Service middleware
-- Browser CORS is deliberately disabled; use an authenticated application adapter.
-- **reqwest** (0.12) - HTTP client with streaming, multipart, and JSON support
+- Browser CORS requires authenticated HTTPS and an exact origin allowlist.
+- **reqwest** (0.12) - HTTP client with streaming, Rustls TLS and JSON support
 
 ### Serialization
 
@@ -231,7 +231,10 @@ trait FavoritesPersistence: Send + Sync {
 
 ## API Specification
 
-### HTTP Endpoints
+### Legacy v1 HTTP Endpoints
+
+Default engine sends use the [v2 endpoints](docs/SECURE_TRANSFERS.md#authenticated-browser-api).
+The following table documents the retained explicit compatibility path.
 
 | Endpoint | Method | Description | Request Body | Response |
 |----------|--------|-------------|--------------|----------|
@@ -259,7 +262,7 @@ JSON datagram, camelCase fields:
 ```json
 {
   "app": "gosh-lan-transfer",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "fingerprint": "uuid-v4",
   "deviceName": "My Device",
   "port": 53317,

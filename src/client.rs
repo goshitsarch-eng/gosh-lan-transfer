@@ -70,10 +70,13 @@ pub(crate) fn http_url(address: &str, port: u16, path_and_query: &str) -> String
 }
 
 /// Client for sending files to a peer
+#[derive(Clone)]
 pub struct TransferClient {
-    http_client: Client,
-    event_handler: Arc<dyn EventHandler>,
-    history: Option<Arc<dyn HistoryPersistence>>,
+    http_client: Option<Client>,
+    config_error: Option<String>,
+    pub(crate) config: EngineConfig,
+    pub(crate) event_handler: Arc<dyn EventHandler>,
+    pub(crate) history: Option<Arc<dyn HistoryPersistence>>,
     /// Maximum retry attempts
     max_retries: u32,
     /// Base delay between retries in milliseconds
@@ -105,18 +108,14 @@ impl TransferClient {
 
     /// Create a new transfer client with config
     pub fn new_with_config(event_handler: Arc<dyn EventHandler>, config: &EngineConfig) -> Self {
-        let http_client = Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            // No global timeout - large file transfers can take a long time
-            // Use read_timeout to detect stalled connections instead
-            .read_timeout(Duration::from_secs(60))
-            .connect_timeout(Duration::from_secs(30))
-            .build()
-            .expect("Failed to create HTTP client");
+        let result = config.security.client();
+        let config_error = result.as_ref().err().map(ToString::to_string);
+        let http_client = result.ok();
 
         Self {
             http_client,
+            config_error,
+            config: config.clone(),
             event_handler,
             history: None,
             max_retries: config.max_retries,
@@ -140,16 +139,14 @@ impl TransferClient {
         history: Arc<dyn HistoryPersistence>,
         config: &EngineConfig,
     ) -> Self {
-        let http_client = Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .read_timeout(Duration::from_secs(60))
-            .connect_timeout(Duration::from_secs(30))
-            .build()
-            .expect("Failed to create HTTP client");
+        let result = config.security.client();
+        let config_error = result.as_ref().err().map(ToString::to_string);
+        let http_client = result.ok();
 
         Self {
             http_client,
+            config_error,
+            config: config.clone(),
             event_handler,
             history: Some(history),
             max_retries: config.max_retries,
@@ -160,9 +157,27 @@ impl TransferClient {
 
     /// Update retry and bandwidth settings from config
     pub fn update_config(&mut self, config: &EngineConfig) {
+        let result = config.security.client();
+        self.config_error = result.as_ref().err().map(ToString::to_string);
+        self.http_client = result.ok();
+        self.config = config.clone();
         self.max_retries = config.max_retries;
         self.retry_delay_ms = config.retry_delay_ms;
         self.bandwidth_limit_bps = config.bandwidth_limit_bps;
+    }
+
+    pub(crate) fn http(&self) -> EngineResult<&Client> {
+        self.http_client.as_ref().ok_or_else(|| {
+            EngineError::InvalidConfig(self.config_error.clone().unwrap_or_default())
+        })
+    }
+    pub(crate) fn url(&self, address: &str, port: u16, path: &str) -> String {
+        let url = http_url(address, port, path);
+        if self.config.security.https {
+            url.replacen("http:", "https:", 1)
+        } else {
+            url
+        }
     }
 
     /// Check if an error is transient and should be retried
@@ -231,9 +246,9 @@ impl TransferClient {
 
     /// Check if a peer is reachable by hitting the /health endpoint
     pub async fn check_peer(&self, address: &str, port: u16) -> EngineResult<bool> {
-        let url = http_url(address, port, "/health");
+        let url = self.url(address, port, "/health");
 
-        match self.http_client.get(&url).send().await {
+        match self.http()?.get(&url).send().await {
             Ok(response) => {
                 if response.status().is_success() {
                     Ok(true)
@@ -264,10 +279,10 @@ impl TransferClient {
 
     /// Get peer info
     pub async fn get_peer_info(&self, address: &str, port: u16) -> EngineResult<serde_json::Value> {
-        let url = http_url(address, port, "/info");
+        let url = self.url(address, port, "/info");
 
         let response = self
-            .http_client
+            .http()?
             .get(&url)
             .send()
             .await
@@ -298,11 +313,11 @@ impl TransferClient {
             total_size,
         };
 
-        let url = http_url(address, port, "/transfer");
+        let url = self.url(address, port, "/transfer");
 
         let mut last_error = None;
         for attempt in 0..=self.max_retries {
-            let result = self.http_client.post(&url).json(&request).send().await;
+            let result = self.http()?.post(&url).json(&request).send().await;
 
             match result {
                 Ok(response) => {
@@ -381,7 +396,7 @@ impl TransferClient {
         port: u16,
         transfer_id: &str,
     ) -> EngineResult<TransferApprovalStatus> {
-        let url = http_url(
+        let url = self.url(
             address,
             port,
             &format!("/transfer/status?transfer_id={}", transfer_id),
@@ -391,7 +406,7 @@ impl TransferClient {
         let started = Instant::now();
 
         loop {
-            let response = self.http_client.get(&url).send().await.map_err(|e| {
+            let response = self.http()?.get(&url).send().await.map_err(|e| {
                 EngineError::Network(format!("Failed to check transfer status: {}", e))
             })?;
 
@@ -450,7 +465,7 @@ impl TransferClient {
 
     /// Send a file to a peer (after transfer is accepted)
     async fn send_file(&self, params: SendFileParams<'_>) -> EngineResult<()> {
-        let url = http_url(
+        let url = self.url(
             params.address,
             params.port,
             &format!(
@@ -549,7 +564,7 @@ impl TransferClient {
 
         // Send the file
         let response = self
-            .http_client
+            .http()?
             .post(&url)
             .header("Content-Type", "application/octet-stream")
             .header("Content-Length", file_size)
@@ -1050,7 +1065,7 @@ impl TransferClient {
     }
 
     /// Recursively collect all files in a directory with their relative paths (async version)
-    async fn collect_directory_files_async(
+    pub(crate) async fn collect_directory_files_async(
         base_path: &Path,
         current_path: &Path,
         files: &mut Vec<(PathBuf, String)>,
@@ -1064,6 +1079,13 @@ impl TransferClient {
             .await
             .map_err(|e| EngineError::FileIo(format!("Failed to read directory entry: {}", e)))?
         {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(".gosh-transfer")
+            {
+                continue;
+            }
             let path = entry.path();
             let file_type = entry
                 .file_type()

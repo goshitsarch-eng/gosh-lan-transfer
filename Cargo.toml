@@ -1,6 +1,6 @@
 [package]
 name = "gosh-lan-transfer"
-version = "0.4.0"
+version = "0.5.0"
 description = "Core file transfer engine for LAN-based peer-to-peer file sharing"
 authors = ["Goshitsarch"]
 license = "MIT"
@@ -30,7 +30,7 @@ serde_json = "1"
 # Network utilities
 local-ip-address = "0.6"
 socket2 = { version = "0.5", features = ["all"] }
-tokio-util = { version = "0.7", features = ["io"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 hostname = "0.4"
 
@@ -39,6 +39,14 @@ futures = "0.3"
 futures-util = "0.3"
 bytes = "1"
 mime_guess = "2"
+
+# Secure transport and durable transfers
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+sha2 = "0.10"
+subtle = "2"
+tempfile = "3"
 
 # Utilities
 uuid = { version = "1", features = ["v4"] }
@@ -50,8 +58,8 @@ tracing = "0.1"
 windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
 
 [dev-dependencies]
+rcgen = "0.13"
 tokio-test = "0.4"
-tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 

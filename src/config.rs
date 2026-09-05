@@ -5,8 +5,10 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 /// Engine configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EngineConfig {
+    /// TLS, authentication and browser-origin policy.
+    pub security: crate::security::SecurityConfig,
     /// Port for the HTTP server (default: 53317)
     pub port: u16,
     /// Device name shown to peers
@@ -37,6 +39,7 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
+            security: crate::security::SecurityConfig::default(),
             port: 53317,
             device_name: hostname::get()
                 .map(|h| h.to_string_lossy().to_string())
@@ -70,6 +73,7 @@ impl EngineConfig {
 /// Builder for EngineConfig
 #[derive(Default)]
 pub struct EngineConfigBuilder {
+    security: Option<crate::security::SecurityConfig>,
     port: Option<u16>,
     device_name: Option<String>,
     download_dir: Option<PathBuf>,
@@ -85,6 +89,11 @@ pub struct EngineConfigBuilder {
 }
 
 impl EngineConfigBuilder {
+    /// Configure TLS, authentication and browser access.
+    pub fn security(mut self, security: crate::security::SecurityConfig) -> Self {
+        self.security = Some(security);
+        self
+    }
     /// Set the port for the HTTP server
     pub fn port(mut self, port: u16) -> Self {
         self.port = Some(port);
@@ -169,6 +178,7 @@ impl EngineConfigBuilder {
     pub fn build(self) -> EngineConfig {
         let default = EngineConfig::default();
         EngineConfig {
+            security: self.security.unwrap_or_default(),
             port: self.port.unwrap_or(default.port),
             device_name: self.device_name.unwrap_or(default.device_name),
             download_dir: self.download_dir.unwrap_or(default.download_dir),
@@ -190,5 +200,16 @@ impl EngineConfigBuilder {
                 .discovery_peer_timeout_secs
                 .unwrap_or(default.discovery_peer_timeout_secs),
         }
+    }
+}
+
+impl std::fmt::Debug for EngineConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineConfig")
+            .field("port", &self.port)
+            .field("device_name", &self.device_name)
+            .field("download_dir", &self.download_dir)
+            .field("security", &self.security)
+            .finish_non_exhaustive()
     }
 }

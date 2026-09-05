@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-09-05
+
+### Fixed
+- Prevent approved metadata replacement, token rotation, duplicate upload files and duplicate completion.
+- Bind approval status and uploads to the original source IP; serialize transfer decisions.
+- Reject duplicate/empty IDs and overflowing sizes; sanitize fallback IDs and Windows filenames.
+- Reject unsafe receive directories and skip symlinks while sending directory trees.
+- Interrupt active/stalled receives on cancellation and delete incomplete files.
+- Retry transient whole-file upload failures with bounded backoff and corrected progress accounting.
+- Report ephemeral ports, explicitly enable dual-stack sockets, await shutdown and synchronize discovery ports.
+- Use Rustls for portable builds and bypass proxies/redirects for direct peer transfers.
+
+### Changed
+- **Browser integration change:** removed wildcard CORS and reject transfer POSTs with an Origin header.
+  Browser applications must use an authenticated backend adapter.
+- `update_config` preserves the HTTP port while running; use `change_port` to rebind.
+- Retain idempotency receipts for one idle hour; cap retained sessions at 1,024.
+
+### Release and documentation
+- Add Linux, macOS and Windows CI, compile-checked API example and regression coverage.
+- Add automatic GitHub releases and crates.io OIDC trusted publishing after CI/package validation.
+- Commit Cargo.lock for repeatable repository builds; document migration, rollout scope and release recovery.
+
+
 ## [Unreleased]
 
 ## [0.3.1] - 2026-08-20

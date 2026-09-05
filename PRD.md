@@ -1,5 +1,11 @@
 # Product Requirements Document
 
+> Updated for 0.4.0: the [rollout review](docs/ROLLOUT.md) defines current support
+> and limitations. See [releasing](docs/RELEASING.md) for CI and publication.
+> Browser writes are disabled; uploads retry whole files with idempotent receipts;
+> directory enumeration skips symlinks. Resume, TLS and checksums are future work.
+
+
 ## Product Overview
 
 gosh-lan-transfer is a Rust library that enables peer-to-peer file transfers over local networks. It provides the core transfer engine without GUI dependencies, allowing integration into CLI tools, desktop applications, mobile apps, or embedded systems.

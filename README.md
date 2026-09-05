@@ -8,6 +8,19 @@ A Rust library for peer-to-peer file transfers over LAN, VPN, or Tailscale netwo
 
 This crate provides the core transfer engine without any GUI dependencies, making it suitable for integration into CLI tools, desktop applications, mobile apps, or headless services. Files transfer directly between devices with no cloud intermediary, keeping your data private and your transfers fast.
 
+## 0.4 migration and release readiness
+
+See the [rollout review](docs/ROLLOUT.md) for fixes, supported scope and remaining
+limitations, and the [release guide](docs/RELEASING.md) for automatic GitHub and
+crates.io publishing. This release restricts browser access: wildcard CORS is
+removed and transfer requests with an `Origin` header are rejected. Use an
+authenticated backend adapter for browser UIs. HTTP itself is unencrypted;
+use this engine only on a trusted LAN or encrypted VPN.
+
+Directory sends skip symlinks and do not reproduce empty directories. File retries
+restart the complete file; there is no persistent resume or checksum verification.
+Receiver cancellation interrupts active uploads and removes incomplete files.
+
 ## Why gosh-lan-transfer?
 
 Sharing files between devices on the same network shouldn't require uploading to the cloud, installing platform-specific software, or configuring SSH keys. Yet existing solutions each come with significant limitations.
@@ -38,7 +51,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-gosh-lan-transfer = "0.3"
+gosh-lan-transfer = "0.4"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -505,6 +518,7 @@ let (mut engine, events) = GoshTransferEngine::with_channel_events_and_history(
 );
 
 // Later: query history
+use gosh_lan_transfer::HistoryPersistence;
 let records = history.list()?;
 let page = history.list_paginated(0, 10)?;
 ```
@@ -572,7 +586,14 @@ SENDER                                    RECEIVER
 
 ### Security
 
-Each approved transfer receives a unique UUID token that must accompany all file uploads, preventing unauthorized data injection. Received filenames are sanitized to prevent path traversal attacks only the filename component is used, and parent directory references are stripped. Files exceeding their declared size are rejected and deleted.
+Each approved transfer receives a unique UUID token. Status polling and uploads
+are bound to the initiating source IP. Reusing a transfer ID with different
+metadata is rejected. Exact retries are idempotent, including lost upload responses.
+
+Received names, fallback IDs and relative paths are sanitized. Existing unsafe
+symlink directories are rejected. Use an application-owned download directory;
+concurrent hostile local filesystem mutation is outside the threat model.
+Incomplete and oversized uploads are rejected and deleted.
 
 Discovery announcements are unauthenticated UDP datagrams and can be spoofed by anyone on the local network. They only populate the peer list: device names are sanitized (control characters stripped, length capped), and discovering a peer never grants it transfer permissions — every incoming transfer still goes through the approval or trusted-host flow.
 

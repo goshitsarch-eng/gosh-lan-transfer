@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-09-05
+
+### Added
+- Optional HTTPS with mandatory certificate/hostname verification and PEM trust configuration.
+- Bearer authentication for every endpoint, redacted credentials and exact browser-origin allowlists.
+- V2 SHA-256 manifests and receiver verification before final file publication.
+- Durable receive journals, partial byte-offset resume and completion receipts across restart.
+- Saved prepared-transfer plans and outgoing cancellation handles, including cancellation during approval.
+- Authenticated browser preflight, status, upload, cancellation and fetch-based SSE access.
+- Terminal receive-session cleanup through `forget_received_transfer`.
+- Security, cancellation and crash-recovery integration tests and a secure-transfer migration guide.
+
+### Changed
+- **Protocol migration:** engine send methods use v2 and require 0.5+ peers; legacy sending is explicit.
+- V2 retains up to 1,024 sessions until explicitly forgotten, instead of expiring restart receipts.
+- Reserve the receiver journal namespace and skip it when sending directories.
+- V2 publication requires a hard-link-capable filesystem and never overwrites existing content.
+- Browser Origin policy applies to all endpoints; authenticated allowlisted origins are supported.
+
 ## [0.4.0] - 2026-09-05
 
 ### Fixed
@@ -28,8 +47,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add automatic GitHub releases and crates.io OIDC trusted publishing after CI/package validation.
 - Commit Cargo.lock for repeatable repository builds; document migration, rollout scope and release recovery.
 
-
-## [Unreleased]
 
 ## [0.3.1] - 2026-08-20
 

@@ -8,18 +8,20 @@ A Rust library for peer-to-peer file transfers over LAN, VPN, or Tailscale netwo
 
 This crate provides the core transfer engine without any GUI dependencies, making it suitable for integration into CLI tools, desktop applications, mobile apps, or headless services. Files transfer directly between devices with no cloud intermediary, keeping your data private and your transfers fast.
 
-## 0.4 migration and release readiness
+## 0.5 migration and release readiness
 
-See the [rollout review](docs/ROLLOUT.md) for fixes, supported scope and remaining
-limitations, and the [release guide](docs/RELEASING.md) for automatic GitHub and
-crates.io publishing. This release restricts browser access: wildcard CORS is
-removed and transfer requests with an `Origin` header are rejected. Use an
-authenticated backend adapter for browser UIs. HTTP itself is unencrypted;
-use this engine only on a trusted LAN or encrypted VPN.
+Version 0.5 adds optional verified HTTPS and bearer authentication, authenticated
+browser origins, SHA-256 verification, persistent byte-offset resume and outgoing
+cancellation handles. Read the [secure transfer guide](docs/SECURE_TRANSFERS.md)
+for configuration, save/resume examples and browser API integration.
 
-Directory sends skip symlinks and do not reproduce empty directories. File retries
-restart the complete file; there is no persistent resume or checksum verification.
-Receiver cancellation interrupts active uploads and removes incomplete files.
+`GoshTransferEngine::send_files` and `send_directory` now require a v2-capable
+receiver (0.5+). Use `send_files_legacy` explicitly for older peers. HTTP remains
+the private-LAN default; configure `SecurityConfig` to enable HTTPS and pairing.
+Directory sends skip symlinks, empty directories and the reserved state directory.
+
+See the [rollout review](docs/ROLLOUT.md) for tested scope and remaining limits,
+and the [release guide](docs/RELEASING.md) for automatic GitHub/crates.io publishing.
 
 ## Why gosh-lan-transfer?
 
@@ -51,7 +53,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-gosh-lan-transfer = "0.4"
+gosh-lan-transfer = "0.5"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -547,57 +549,38 @@ match engine.send_files(addr, port, files).await {
 
 ## Transfer Protocol
 
-The engine uses HTTP for all transfers, ensuring compatibility across firewalls and NAT. No custom binary protocol means standard tools can inspect traffic for debugging.
-
-### Endpoints
+The engine supports HTTP or verified HTTPS. The default engine send methods use
+protocol v2 with a SHA-256 manifest, approval, durable offset queries, upload and
+verified publication. See the [wire protocol and browser guide](docs/SECURE_TRANSFERS.md#authenticated-browser-api).
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check |
-| `/info` | GET | Device name and version |
-| `/transfer` | POST | Initiate transfer request |
-| `/transfer/status` | GET | Check approval status |
-| `/chunk` | POST | Upload file data |
+| `/info` | GET | Device name, version and capabilities |
+| `/v2/transfer` | POST | Register resumable manifest |
+| `/v2/status` | GET | Approval, durable offsets and completion |
+| `/v2/chunk` | POST | Append remaining bytes and verify SHA-256 |
+| `/v2/cancel` | POST | Cancel an outgoing transfer at the receiver |
 | `/events` | GET | SSE stream for real-time events |
-
-### Transfer Flow
-
-```
-SENDER                                    RECEIVER
-  │                                          │
-  │── POST /transfer ──────────────────────▶│
-  │   {transfer_id, files[], total_size}     │
-  │                                          │
-  │◀── 200 {accepted: false} ───────────────│
-  │    (or accepted: true if trusted)        │
-  │                                          │
-  │                                          │ User approves
-  │                                          │
-  │── GET /transfer/status ────────────────▶│
-  │◀── {status: "accepted", token: "..."} ──│
-  │                                          │
-  │── POST /chunk?token=...&file_id=... ───▶│
-  │   [binary file data]                     │
-  │◀── 200 OK ──────────────────────────────│
-  │                                          │
-  │   (repeat for each file)                 │
-  │                                          │
-```
+| `/transfer`, `/transfer/status`, `/chunk` | POST, GET, POST | Legacy v1 compatibility |
 
 ### Security
 
-Each approved transfer receives a unique UUID token. Status polling and uploads
-are bound to the initiating source IP. Reusing a transfer ID with different
-metadata is rejected. Exact retries are idempotent, including lost upload responses.
+Configure HTTPS and a shared bearer token for authenticated transfers. Certificate
+and hostname verification cannot be disabled, and tokens cannot be configured
+over plaintext. Browser access requires authenticated HTTPS and an exact origin
+allowlist. Approval is still required unless the source IP is trusted.
 
-Received names, fallback IDs and relative paths are sanitized. Existing unsafe
-symlink directories are rejected. Use an application-owned download directory;
-concurrent hostile local filesystem mutation is outside the threat model.
-Incomplete and oversized uploads are rejected and deleted.
+V2 sessions are bound to the authenticated token identity, or to source IP in
+plaintext mode. Files are SHA-256 checked before publication. Interrupted prefixes
+are retained for resume; oversized or checksum-invalid files are discarded.
+Received paths are sanitized and unsafe symlink directories are rejected. Use an
+application-owned download directory; hostile local filesystem mutation is
+outside the threat model. The filesystem must support hard links for v2 receive.
 
-Discovery announcements are unauthenticated UDP datagrams and can be spoofed by anyone on the local network. They only populate the peer list: device names are sanitized (control characters stripped, length capped), and discovering a peer never grants it transfer permissions — every incoming transfer still goes through the approval or trusted-host flow.
-
-The library is designed for trusted networks and does not implement user authentication. If you need transfers over untrusted networks, layer TLS on top or use a VPN.
+Discovery announcements are unauthenticated and only populate the peer list.
+Discovered peers do not gain transfer permissions. Pair credentials and trust
+certificates through a trusted channel, and select HTTPS explicitly.
 
 ## Examples
 

@@ -57,12 +57,17 @@
 pub mod client;
 pub mod config;
 pub mod discovery;
+mod durable;
 pub mod error;
 pub mod events;
 pub mod favorites;
 pub mod history;
 pub mod protocol;
+pub mod resumable;
+pub mod security;
 pub mod server;
+pub use resumable::{PreparedFile, PreparedTransfer, TransferHandle};
+pub use security::{SecurityConfig, TlsIdentity};
 mod throttle;
 pub mod types;
 
@@ -216,6 +221,7 @@ impl GoshTransferEngine {
     pub async fn stop_server(&mut self) -> EngineResult<()> {
         if let Some(handle) = self.server_handle.take() {
             handle.shutdown_and_wait().await;
+            self.server_state.durable.close().await;
             self.event_handler.on_event(EngineEvent::ServerStopped);
         }
         Ok(())
@@ -453,14 +459,8 @@ impl GoshTransferEngine {
             ));
         }
 
-        self.client
-            .send_files(
-                address,
-                port,
-                file_paths,
-                Some(self.config.device_name.clone()),
-            )
-            .await
+        let plan = self.prepare_files(address, port, file_paths).await?;
+        self.client.send_prepared(plan).await
     }
 
     /// Send a directory and all its contents to a peer
@@ -479,14 +479,75 @@ impl GoshTransferEngine {
             ));
         }
 
+        let plan = self.prepare_directory(address, port, dir_path).await?;
+        self.client.send_prepared(plan).await
+    }
+
+    /// Prepare a checksum-verified transfer. Save the plan before sending for restart recovery.
+    pub async fn prepare_files(
+        &self,
+        address: &str,
+        port: u16,
+        paths: Vec<PathBuf>,
+    ) -> EngineResult<PreparedTransfer> {
+        if self.config.receive_only {
+            return Err(EngineError::InvalidConfig(
+                "Sending is disabled in receive-only mode".into(),
+            ));
+        }
         self.client
-            .send_directory(
+            .prepare_files(address, port, paths, Some(self.config.device_name.clone()))
+            .await
+    }
+    /// Prepare all regular files in a directory for resumable sending.
+    pub async fn prepare_directory(
+        &self,
+        address: &str,
+        port: u16,
+        path: impl AsRef<std::path::Path>,
+    ) -> EngineResult<PreparedTransfer> {
+        if self.config.receive_only {
+            return Err(EngineError::InvalidConfig(
+                "Sending is disabled in receive-only mode".into(),
+            ));
+        }
+        self.client
+            .prepare_directory(
                 address,
                 port,
-                dir_path,
+                path.as_ref(),
                 Some(self.config.device_name.clone()),
             )
             .await
+    }
+    /// Start a prepared transfer and obtain an outgoing cancellation handle.
+    pub fn start_prepared(&self, plan: PreparedTransfer) -> TransferHandle {
+        self.client.start_prepared(plan)
+    }
+    /// Resume a previously saved plan, preserving the original transfer and file IDs.
+    pub async fn send_prepared(&self, plan: PreparedTransfer) -> EngineResult<()> {
+        self.client.send_prepared(plan).await
+    }
+    /// Explicit compatibility path for peers older than 0.5. No checksums or durable resume.
+    pub async fn send_files_legacy(
+        &self,
+        address: &str,
+        port: u16,
+        paths: Vec<PathBuf>,
+    ) -> EngineResult<()> {
+        if self.config.receive_only {
+            return Err(EngineError::InvalidConfig(
+                "Sending is disabled in receive-only mode".into(),
+            ));
+        }
+        self.client
+            .send_files(address, port, paths, Some(self.config.device_name.clone()))
+            .await
+    }
+    /// Remove a terminal receive journal and partial data, retaining delivered files.
+    /// Active sessions must be cancelled first. A forgotten ID no longer has retry receipts.
+    pub async fn forget_received_transfer(&self, id: &str) -> EngineResult<()> {
+        self.server_state.durable.forget(id).await
     }
 
     /// Accept a pending transfer
@@ -604,11 +665,14 @@ impl GoshTransferEngine {
     /// This updates the engine config, client config, server state config,
     /// and discovery state config. Changes to discovery settings (multicast
     /// group, port, intervals) take effect the next time discovery is started.
-    /// While the server is running, its port is preserved; use `change_port` to rebind.
+    /// While running, port, download directory and TLS identity are preserved.
+    /// Use `change_port` to rebind; stop, update and start to change storage or TLS.
     pub async fn update_config(&mut self, mut config: EngineConfig) {
         // Port changes require binding and can fail: use change_port while running.
         if self.is_server_running() {
             config.port = self.config.port;
+            config.download_dir = self.config.download_dir.clone();
+            config.security.identity = self.config.security.identity.clone();
         }
         self.client.update_config(&config);
         self.config = config.clone();
@@ -789,3 +853,7 @@ mod tests {
         assert_eq!(engine.port(), 12345);
     }
 }
+
+/// Configuration, migration and wire-protocol guide with checked Rust examples.
+#[doc = include_str!("../docs/SECURE_TRANSFERS.md")]
+pub mod secure_transfer_guide {}

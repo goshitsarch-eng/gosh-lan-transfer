@@ -1,9 +1,9 @@
 # Product Requirements Document
 
-> Updated for 0.4.0: the [rollout review](docs/ROLLOUT.md) defines current support
-> and limitations. See [releasing](docs/RELEASING.md) for CI and publication.
-> Browser writes are disabled; uploads retry whole files with idempotent receipts;
-> directory enumeration skips symlinks. Resume, TLS and checksums are future work.
+> Updated for 0.5.0: see [secure transfers](docs/SECURE_TRANSFERS.md) for TLS,
+> authentication, browser access, checksums, durable resume and sender cancellation.
+> The [rollout review](docs/ROLLOUT.md) defines scope and limitations, and
+> [releasing](docs/RELEASING.md) describes automatic publication.
 
 
 ## Product Overview
@@ -167,9 +167,9 @@ gosh-lan-transfer is a Rust library that enables peer-to-peer file transfers ove
 
 ## Future Considerations
 
-1. **Peer Discovery** - mDNS/Bonjour for automatic peer detection (users can manually enter IP/hostname)
-2. **Transfer Resume** - Checkpoint and resume interrupted transfers (retry logic handles transient failures)
+1. **Peer Discovery** - Optional mDNS/Bonjour alongside existing UDP multicast
+2. **Configurable Retention** - Application-specific durable-session quotas and expiry policies
 3. **Compression** - Optional on-the-fly compression for slow networks
-4. **Encryption** - TLS support for transfers over untrusted networks
-5. **Bandwidth Throttling** - Actual rate limiting implementation (config field added, throttling pending)
+4. **Credential Management** - Multi-user identities and certificate enrollment
+5. **Adaptive Bandwidth** - Dynamic bandwidth allocation across simultaneous transfers
 6. **Concurrent Transfer Queue** - Queue and run multiple sends in parallel

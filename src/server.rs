@@ -45,6 +45,8 @@ use crate::types::{TransferDirection, TransferRecord, TransferStatus};
 
 /// Server state shared across handlers
 pub struct ServerState {
+    pub(crate) listener_tls: std::sync::atomic::AtomicBool,
+    pub(crate) durable: crate::durable::DurableStore,
     // Serialize decisions and request registration, and uploads within each transfer.
     decisions: Mutex<()>,
     upload_locks: std::sync::Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
@@ -107,6 +109,8 @@ impl ServerState {
         let (internal_event_tx, _) = broadcast::channel(100);
 
         Self {
+            listener_tls: std::sync::atomic::AtomicBool::new(false),
+            durable: crate::durable::DurableStore::default(),
             decisions: Mutex::new(()),
             upload_locks: std::sync::Mutex::new(HashMap::new()),
             completed: RwLock::new(HashSet::new()),
@@ -134,6 +138,8 @@ impl ServerState {
         let (internal_event_tx, _) = broadcast::channel(100);
 
         Self {
+            listener_tls: std::sync::atomic::AtomicBool::new(false),
+            durable: crate::durable::DurableStore::default(),
             decisions: Mutex::new(()),
             upload_locks: std::sync::Mutex::new(HashMap::new()),
             completed: RwLock::new(HashSet::new()),
@@ -153,7 +159,7 @@ impl ServerState {
     }
 
     /// Emit an event to both the event handler and internal SSE channel
-    fn emit_event(&self, event: EngineEvent) {
+    pub(crate) fn emit_event(&self, event: EngineEvent) {
         // Send to the event handler
         self.event_handler.on_event(event.clone());
 
@@ -176,7 +182,7 @@ impl ServerState {
     }
 
     /// Record a completed or failed receive transfer to history
-    fn record_receive_history(
+    pub(crate) fn record_receive_history(
         &self,
         transfer: &PendingTransfer,
         status: TransferStatus,
@@ -204,6 +210,9 @@ impl ServerState {
 
     /// Accept a pending transfer
     pub async fn accept_transfer(&self, transfer_id: &str) -> EngineResult<String> {
+        if self.durable.contains(transfer_id).await {
+            return self.durable.accept_transfer(self, transfer_id).await;
+        }
         let _decision = self.decisions.lock().await;
         if self.completed.read().await.contains(transfer_id) {
             return Err(EngineError::TransferNotFound(transfer_id.to_string()));
@@ -241,6 +250,9 @@ impl ServerState {
 
     /// Reject a pending transfer
     pub async fn reject_transfer(&self, transfer_id: &str) -> EngineResult<()> {
+        if self.durable.contains(transfer_id).await {
+            return self.durable.reject_transfer(self, transfer_id).await;
+        }
         let _decision = self.decisions.lock().await;
         if self.completed.read().await.contains(transfer_id) {
             return Err(EngineError::TransferNotFound(transfer_id.to_string()));
@@ -281,6 +293,9 @@ impl ServerState {
     ///
     /// This will cause subsequent chunk uploads to be rejected.
     pub async fn cancel_transfer(&self, transfer_id: &str) -> EngineResult<()> {
+        if self.durable.contains(transfer_id).await {
+            return self.durable.cancel_transfer(self, transfer_id).await;
+        }
         let _decision = self.decisions.lock().await;
         if self.completed.read().await.contains(transfer_id) {
             return Err(EngineError::TransferNotFound(transfer_id.to_string()));
@@ -348,11 +363,16 @@ impl ServerState {
         let pending = self.pending_transfers.read().await;
         let approved = self.approved_tokens.read().await;
         let rejected = self.rejected_transfers.read().await;
-        pending
+        let mut transfers: Vec<_> = pending
             .values()
             .filter(|t| !approved.contains_key(&t.id) && !rejected.contains_key(&t.id))
             .cloned()
-            .collect()
+            .collect();
+        drop(pending);
+        drop(approved);
+        drop(rejected);
+        transfers.extend(self.durable.pending().await);
+        transfers
     }
 
     /// Update the configuration
@@ -424,6 +444,14 @@ pub fn create_router(state: Arc<ServerState>) -> Router {
         .route("/chunk", post(chunk_upload_handler))
         // SSE endpoint for transfer progress
         .route("/events", get(events_handler))
+        .route("/v2/transfer", post(crate::durable::register))
+        .route("/v2/status", get(crate::durable::status))
+        .route("/v2/chunk", post(crate::durable::upload))
+        .route("/v2/cancel", post(crate::durable::cancel))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::security::authorize,
+        ))
         .with_state(state)
 }
 
@@ -457,7 +485,7 @@ fn sanitize_file_name(name: &str, fallback: &str) -> String {
 
 // Reject existing symlink/junction paths before traversing them. The download root
 // must be application-owned; concurrent local filesystem mutation is outside the threat model.
-async fn create_receive_parent(root: &Path, parent: &Path) -> std::io::Result<()> {
+pub(crate) async fn create_receive_parent(root: &Path, parent: &Path) -> std::io::Result<()> {
     let canonical_root = tokio::fs::canonicalize(root).await?;
     let relative = parent.strip_prefix(root).map_err(std::io::Error::other)?;
     let mut current = canonical_root.clone();
@@ -525,7 +553,7 @@ fn sanitize_relative_path(path: &str) -> PathBuf {
 /// `download_dir` itself; using `.parent()` then wrote *outside* the download
 /// folder. That both escaped the sandbox and made files "disappear" from the
 /// expected download section.
-fn receive_target(
+pub(crate) fn receive_target(
     download_dir: &Path,
     file_info: &crate::protocol::TransferFile,
 ) -> (PathBuf, String) {
@@ -555,7 +583,7 @@ fn receive_target(
 
 /// Normalize a peer IP for trusted-host matching.
 /// Dual-stack listeners report IPv4 clients as `::ffff:a.b.c.d`.
-fn normalize_ip(ip: std::net::IpAddr) -> String {
+pub(crate) fn normalize_ip(ip: std::net::IpAddr) -> String {
     match ip {
         std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => v4.to_string(),
@@ -625,7 +653,9 @@ async fn info_handler(State(state): State<Arc<ServerState>>) -> impl IntoRespons
         "name": config.device_name,
         "deviceName": config.device_name,
         "version": env!("CARGO_PKG_VERSION"),
-        "app": "gosh-lan-transfer"
+        "app": "gosh-lan-transfer",
+        "protocols": ["v1", "v2"],
+        "capabilities": ["sha256", "resume", "cancel"]
     }))
 }
 
@@ -633,7 +663,6 @@ async fn info_handler(State(state): State<Arc<ServerState>>) -> impl IntoRespons
 async fn transfer_request_handler(
     State(state): State<Arc<ServerState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: axum::http::HeaderMap,
     Json(request): Json<TransferRequest>,
 ) -> impl IntoResponse {
     let _decision = state.decisions.lock().await;
@@ -661,13 +690,8 @@ async fn transfer_request_handler(
         state.completed.write().await.remove(&id);
         state.last_activity.lock().await.remove(&id);
     }
-    // Browser requests must not turn a trusted host into a drive-by upload service.
-    if headers.contains_key(axum::http::header::ORIGIN) {
-        return (
-            StatusCode::FORBIDDEN,
-            "Browser transfer requests are disabled",
-        )
-            .into_response();
+    if state.durable.contains(&request.transfer_id).await {
+        return (StatusCode::CONFLICT, "ID belongs to a resumable transfer").into_response();
     }
     let mut ids = HashSet::new();
     if request.transfer_id.is_empty()
@@ -1003,6 +1027,12 @@ async fn chunk_upload_handler(
     // Resolve a destination that is always inside download_dir, even when the
     // relative path is empty or made entirely of `..` components.
     let (parent_dir, base_name) = receive_target(&download_dir, &file_info);
+    if reserved_target(&download_dir, &parent_dir.join(&base_name)) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"Reserved state directory"})),
+        );
+    }
     if let Err(e) = create_receive_parent(&download_dir, &parent_dir).await {
         tracing::error!("Failed to create directory structure: {}", e);
         return (
@@ -1344,6 +1374,11 @@ async fn events_handler(
 
 /// Start the HTTP server and return a handle for controlling it
 pub async fn start_server(state: Arc<ServerState>, port: u16) -> EngineResult<ServerHandle> {
+    let tls = state.config.read().await.security.server_tls().await?;
+    state.durable.load(&state).await?;
+    state
+        .listener_tls
+        .store(tls.is_some(), std::sync::atomic::Ordering::SeqCst);
     let app = create_router(state.clone());
 
     tracing::info!("Starting server on port {}", port);
@@ -1399,17 +1434,33 @@ pub async fn start_server(state: Arc<ServerState>, port: u16) -> EngineResult<Se
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-    // Spawn the server in the background
+    let listener = listener.into_std()?;
+    // axum-server handles concurrent TLS handshakes and bounded graceful shutdown.
+    let handle = axum_server::Handle::new();
+    let shutdown_handle = handle.clone();
     let task = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async {
-            let _ = shutdown_rx.await;
-        })
-        .await
-        .ok();
+        let server = async {
+            let service = app.into_make_service_with_connect_info::<SocketAddr>();
+            if let Some(tls) = tls {
+                axum_server::from_tcp_rustls(listener, tls)?
+                    .handle(handle)
+                    .serve(service)
+                    .await
+            } else {
+                axum_server::from_tcp(listener)?
+                    .handle(handle)
+                    .serve(service)
+                    .await
+            }
+        };
+        tokio::pin!(server);
+        tokio::select! {
+            result = &mut server => { if let Err(error) = result { tracing::error!(%error, "Listener stopped"); } },
+            _ = shutdown_rx => {
+                shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(1)));
+                let _ = server.await;
+            }
+        }
     });
 
     // Emit server started event
@@ -1422,6 +1473,19 @@ pub async fn start_server(state: Arc<ServerState>, port: u16) -> EngineResult<Se
         task,
         port,
     })
+}
+
+// Keep the journal namespace reserved even on case-insensitive filesystems.
+pub(crate) fn reserved_target(download: &std::path::Path, target: &std::path::Path) -> bool {
+    target
+        .strip_prefix(download)
+        .ok()
+        .and_then(|p| p.components().next())
+        .is_some_and(|c| {
+            c.as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(".gosh-transfer")
+        })
 }
 
 #[cfg(test)]

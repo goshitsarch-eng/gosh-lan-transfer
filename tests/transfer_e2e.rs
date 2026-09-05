@@ -436,7 +436,15 @@ async fn info_cors_and_sse_event_type() {
         None,
         "untrusted browser origins must not get CORS access"
     );
-    let body: serde_json::Value = info.json().await.unwrap();
+    assert_eq!(info.status(), reqwest::StatusCode::FORBIDDEN);
+    let body: serde_json::Value = http
+        .get(format!("http://127.0.0.1:{port}/info"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(body["name"], "CorsBox");
     assert_eq!(
         body["deviceName"], "CorsBox",
@@ -454,7 +462,7 @@ async fn info_cors_and_sse_event_type() {
         .await
         .unwrap();
     assert!(
-        preflight.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED,
+        preflight.status() == reqwest::StatusCode::FORBIDDEN,
         "unexpected preflight status {}",
         preflight.status()
     );

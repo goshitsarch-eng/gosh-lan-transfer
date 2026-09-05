@@ -213,9 +213,14 @@ async fn restart_rebinds_and_runtime_config_reports_actual_port() {
     let (mut e, _, _) = receiver().await;
     let port = e.port();
     assert_ne!(port, 0);
-    let config = EngineConfig::builder().port(12345).build();
+    let download = e.config().download_dir.clone();
+    let config = EngineConfig::builder()
+        .port(12345)
+        .download_dir("changed-location")
+        .build();
     e.update_config(config).await;
     assert_eq!(e.port(), port);
+    assert_eq!(e.config().download_dir, download);
     e.stop_server().await.unwrap();
     e.start_server().await.unwrap();
     assert!(e.check_peer("127.0.0.1", port).await.unwrap());
@@ -279,7 +284,7 @@ async fn upload_retries_server_failures_but_not_client_errors() {
         );
         assert_eq!(
             sender
-                .send_files("127.0.0.1", port, vec![path])
+                .send_files_legacy("127.0.0.1", port, vec![path])
                 .await
                 .is_ok(),
             succeeds
